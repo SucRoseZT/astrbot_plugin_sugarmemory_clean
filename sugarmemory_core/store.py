@@ -274,6 +274,18 @@ def count_conversations(rows: list[dict]) -> int:
     return len(convs)
 
 
+def _bigrams(text: str) -> set[str]:
+    text = re.sub(r"\s+", "", str(text or ""))
+    if len(text) < 2:
+        return {text} if text else set()
+    return {text[i: i + 2] for i in range(len(text) - 1)}
+
+
+def _l2_text(row: dict) -> str:
+    return (f"{row.get('subject', '')}{row.get('predicate', '')}"
+            f"{row.get('value', '')}{row.get('ask_alias', '')}")
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS l2_facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1230,25 +1242,57 @@ class SugarStore:
         hits.sort(key=len, reverse=True)
         return hits[: max(1, int(limit))]
 
-    def query_active_l2(self, subject: str | None = None, limit: int = 60) -> list[dict]:
-        """查询 active L2（带出处/置信度）。与 L3 查询完全隔离。"""
+    def query_active_l2(self, subject: str | None = None, limit: int = 60,
+                        query: str = "", candidate_limit: int = 200) -> list[dict]:
+        """查询 active L2（带出处/置信度）。与 L3 查询完全隔离。
+
+        query 非空时走「先过滤、后截断」：SQL 只按作用域 / 状态 / 有效期过滤，
+        不先按置信度 LIMIT，再在 Python 里按本轮 bigram 相关度排序取 top limit。
+        旧的 `ORDER BY confidence ... LIMIT 80` 会让攒到 80 条以上的用户，
+        低置信但本轮高度相关的事实永远进不了候选池，相关性排序根本没机会发力。
+
+        query 为空时保持旧行为（按置信度排序），常驻包 / 面板 / memory_search
+        这些不按本轮话题取材的路径不受影响。
+        """
         now = time.time()
+        lim = max(1, int(limit or 60))
+        cap = int(candidate_limit or 0)
+        if cap > 0:
+            lim = min(lim, cap)  # 只压返回条数，不做预截断
+        q = str(query or "").strip()
         with self._lock:
             if subject:
-                rows = self._db.execute(
-                    "SELECT * FROM l2_facts WHERE status='active' AND subject=?"
-                    " AND (expires_at = 0 OR expires_at > ?)"
-                    " ORDER BY confidence DESC, stability DESC, updated_at DESC LIMIT ?",
-                    (subject, now, int(limit)),
-                ).fetchall()
+                sql = ("SELECT * FROM l2_facts WHERE status='active' AND subject=?"
+                       " AND (expires_at = 0 OR expires_at > ?)")
+                args: tuple = (subject, now)
+                if not q:
+                    sql += " ORDER BY confidence DESC, stability DESC, updated_at DESC LIMIT ?"
+                    args = (subject, now, lim)
+                rows = self._db.execute(sql, args).fetchall()
             else:
-                rows = self._db.execute(
-                    "SELECT * FROM l2_facts WHERE status='active'"
-                    " AND (expires_at = 0 OR expires_at > ?)"
-                    " ORDER BY confidence DESC, stability DESC, updated_at DESC LIMIT ?",
-                    (now, int(limit)),
-                ).fetchall()
-        return [dict(r) for r in rows]
+                sql = ("SELECT * FROM l2_facts WHERE status='active'"
+                       " AND (expires_at = 0 OR expires_at > ?)")
+                args = (now,)
+                if not q:
+                    sql += " ORDER BY confidence DESC, stability DESC, updated_at DESC LIMIT ?"
+                    args = (now, lim)
+                rows = self._db.execute(sql, args).fetchall()
+        out = [dict(r) for r in rows]
+        if not q:
+            return out
+        # 不做任何「先截 N 条再排序」的保护：按时间或置信度预截断都会重新
+        # 把老而相关的事实挡在门外。limit 只是「返回条数」，由调用方的
+        # pack_l2_candidate_limit 控制；这个量级的 L2 全量 bigram 打分 <2ms。
+        qg = _bigrams(q)
+        if not qg:
+            out.sort(key=lambda r: (float(r.get("confidence") or 0),
+                                    int(r.get("stability") or 0)), reverse=True)
+            return out[:lim]
+        scored = [(len(qg & _bigrams(_l2_text(r))), r) for r in out]
+        scored.sort(key=lambda x: (-x[0], -float(x[1].get("confidence") or 0),
+                                   -int(x[1].get("stability") or 0),
+                                   -float(x[1].get("updated_at") or 0)))
+        return [r for _, r in scored[:lim]]
 
     def get_l2(self, fact_id: int) -> dict | None:
         with self._lock:

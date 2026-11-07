@@ -1,6 +1,7 @@
 """记忆包组装：检索、排序、裁剪、可解释输出。零 LLM 调用。
 关键词 2-gram 检索独立工作；向量检索为可选增强（预留接口，不默认依赖）。
 """
+import math
 import re
 import time
 
@@ -19,6 +20,49 @@ def _bigrams(text: str) -> set[str]:
     return {text[i: i + 2] for i in range(len(text) - 1)}
 
 
+# 意图规则只用来微调各通道权重，不用来开关通道：判错顶多是排序差一点，
+# 判成开关则会整条路召回不到。规则一律是通用中文口语，不为个案硬编码。
+_REL_Q = re.compile(r"谁|认识|朋友|关系|对象|恋人|男朋友|女朋友|老婆|老公|叫什么|名字|一起")
+_TIME_Q = re.compile(r"上次|之前|刚才|以前|曾经|那时候|那天|聊过|说过|发过|还记得")
+_FACT_Q = re.compile(r"是什么|怎么|为什么|几|多少|喜欢|在哪|叫|记得吗")
+_REL_PRED = re.compile(r"关系|朋友|对象|恋人|称呼|名字|认识|家人|同事")
+_NUM_RE = re.compile(r"[0-9零一二两三四五六七八九十百千万]+")
+
+
+def _l2_text(r: dict) -> str:
+    return (f"{r.get('subject', '')}{r.get('predicate', '')}"
+            f"{r.get('value', '')}{r.get('ask_alias', '')}")
+
+
+def _l2_content(r: dict) -> str:
+    return (f"{r.get('predicate', '')}{r.get('value', '')}"
+            f"{r.get('ask_alias', '')}")
+
+
+# ---- 常驻底档的 predicate 权重 ----
+# 只回答一个问题：「这条事实，不看这轮聊什么也该知道吗？」
+#
+# 为什么需要它：常驻排序原来是 conf + min(stab,5)*0.1 + retention*0.3。
+# stability 每级 0.1、最高 +0.5，是置信度差距（通常 0.05）的十倍——**越反复
+# 聊的话题 stability 越高，就越永久霸占常驻前排**。实测用户库里 stab=5 的
+# 「自己给机器人写了一堆插件」稳坐第 1 位，四条 stab=4 的「觉得别人插件差」
+# 把 conf 0.9 抬进前 16。这些恰恰是最该等话题再召回的。
+#
+# 分档依据：
+#   身份/关系 —— 每条都在决定 AI 怎么称呼、怎么关心这个人，必须常驻；
+#   习惯/技能 —— 人物画像的骨架，常驻但让位于身份；
+#   打算       —— 有时效，常驻价值中等；
+#   经历/评价  —— 某个话题下才有用，聊到再召回（0.55 足够压过 stab 满级加成）。
+# 不在这张表里的 predicate 走 0.8，宁可保守也不误伤新分类。
+_RESIDENT_WEIGHT = {
+    "自我相关": 1.0, "其他": 1.0, "关系": 1.0, "称呼": 1.0,
+    "生活习惯": 0.9, "爱好技能": 0.9,
+    "打算": 0.7,
+    "经历": 0.55, "评价认为": 0.55,
+}
+_RESIDENT_WEIGHT_DEFAULT = 0.8
+
+
 # ---- query 概念归一（零成本补召回的第一层）----
 # 中文口语的改写问法（「多大了」vs「16岁」）2-gram 字面零重叠，闸门必砍。
 # 这里把常见问法映射到「概念词」，检索前拼接到 query 尾部：原文保留（字面
@@ -28,8 +72,12 @@ def _bigrams(text: str) -> set[str]:
 _QUERY_CONCEPTS: list[tuple[re.Pattern, str]] = [
     (re.compile(p), concepts) for p, concepts in (
         (r"多大|几岁|年龄|年纪|岁数", "岁 年龄"),
-        (r"吃|喝|宵夜|夜宵|零食|做饭|下饭|点东西", "吃 食物 饮食"),
-        (r"睡|熬夜|失眠|作息|通宵|起床|才醒", "睡 作息 熬夜"),
+        (r"吃|喝|宵夜|夜宵|零食|做饭|下饭|点东西|饿|馋", "吃 食物 饮食"),
+        # 「困」单字命中睡眠，但要排除「困难 / 贫困 / 围困 / 困境 / 困惑 /
+        # 困扰 / 被困住」这些非睡眠义。前缀看一字符足够：中文里这些词的第二
+        # 字固定，往后多看会误伤「好困得不行」。
+        (r"睡|熬夜|失眠|作息|通宵|起床|才醒|补觉|赖床|疲"
+         r"|(?<![难贫围境扰惑被])困(?!难|境|惑|扰|住|局)", "睡 作息 熬夜"),
         (r"心理医生|看病|去医院|抑郁|焦虑|失眠|崩溃|状态不好|休息", "心理 病 状态"),
         (r"人设|形象|设定|马甲|网名", "形象 人设"),
         (r"创作|作品|搞什么|玩什么|接稿|约稿|画稿", "创作 作品 稿"),
@@ -263,7 +311,11 @@ class PackBuilder:
                  skeleton_limit: int = 0,
                  bot_id: str = "",
                  lite: bool = False,
-                 logger=None):
+                 logger=None,
+                 candidate_limit: int = 200,
+                 context_rounds: int = 3,
+                 mmr_enabled: bool = True,
+                 idf_enabled: bool = True):
         # 日志由调用方注入：运行路径在 main.py 传入从 astrbot.api 导入的 logger。
         # 本模块不导入任何日志库（内置日志模块 / 第三方日志库都不用），
         # 离线测试直接构造 PackBuilder 时 logger 为 None，裁剪告警静默。
@@ -335,8 +387,17 @@ class PackBuilder:
         self.query_expand = bool(query_expand)
         # 语义兜底钩子（可选）：字面/概念/别名全部零命中时才调用。
         # 签名 semantic_fn(query_raw, rows) -> {l2_id: 0~1 分}。
-        # 线上由 main 注入 embedding 实现（provider 不支持时传 None）。
+        # 线上由 main 在异步上下文里预计算好分数，这里只做纯查表，不碰网络。
+        # 没配 embedding provider 时传 None，整条语义路完全不通电。
         self.semantic_fn = semantic_fn
+        # L2 候选池上限：SQL 先按作用域/状态/有效期过滤，不按置信度 LIMIT，
+        # 再由 _score_l2 按本轮相关度取用。0 = 不设上限（全库）。
+        self.candidate_limit = max(0, int(candidate_limit or 0))
+        # 最近几轮用户原话参与检索（只给检索，不进 _asks_* 问法判断）。
+        self.context_rounds = max(0, int(context_rounds or 0))
+        # IDF 加权 + 查询内 min-max 归一 / L2 近重复去重，都能单独回退。
+        self.idf_enabled = bool(idf_enabled)
+        self.mmr_enabled = bool(mmr_enabled)
         # 旧事骨架常驻条数：l3_skeleton 行（原话过期后压成的主题词索引）。
         # 常驻不按 query 挑——骨架就几个词，按相关性挑会重演「改写零命中
         # 永远召不回」，而它一行才 ~30 token，常驻 N 条的成本可预期。
@@ -387,33 +448,121 @@ class PackBuilder:
             pass
         return False
 
-    def _score_l2(self, rows: list[dict], query: str) -> list[dict]:
-        if not query:
+    def _score_l2(self, rows: list[dict], query: str,
+                  context: str = "") -> list[dict]:
+        """给 L2 候选打分。
+
+        四个和旧版不同的地方，都是为了避免「不同量纲直接相加」：
+          1) bigram 命中按 IDF 加权（候选池内的文档频率），「的/了/是」自动降权；
+          2) 加权相关度在本查询内 min-max 归一，长 value 不再靠字数天然领先；
+          3) 置信度 / 保留度各自只占 0.15，不再当常量偏移主导排序；
+          4) 最近几轮原话按 0.4 权重补召回，本轮原话仍是主判据。
+        _rel 保留「命中数」语义给 _filter_by_relevance 的闸门和 _count_hit 用。
+        """
+        qg = _bigrams(query)
+        cg = _bigrams(context) if context else set()
+        qall = qg | cg
+        grams = [_bigrams(_l2_text(r)) for r in rows]
+        cgrams = [_bigrams(_l2_content(r)) for r in rows]
+        if not qall:
             for r in rows:
                 r["_rel"] = 0
                 r["_rel_content"] = 0
-            return rows
-        qg = _bigrams(query)
-        for r in rows:
-            # 比对文本 = subject + predicate + value + ask_alias。
-            # ask_alias 是总结阶段生成的「用户可能怎么问」的说法列——
-            # 改写问法跟 value 零重叠，但跟问法别名是字面重叠，靠它进闸门。
-            text = (f"{r.get('subject','')}{r.get('predicate','')}"
-                    f"{r.get('value','')}{r.get('ask_alias','')}")
-            # 内容匹配单独算一遍（不含 subject）：query 里只出现了人名时，
-            # 整份档案都会蹭到 _rel>0——那是「点名带出档案」，不是「想起这条
-            # 事实」。提起度只认内容匹配，防止随口叫人名把计数刷爆。
-            content = (f"{r.get('predicate','')}{r.get('value','')}"
-                       f"{r.get('ask_alias','')}")
-            r["_rel"] = len(qg & _bigrams(text))
-            r["_rel_content"] = len(qg & _bigrams(content))
-            # 保留度只做同等相关时的次级权重（0~0.3），刻意压得很低：
-            # 一个 2-gram 命中值 2.0 分，相关性永远优先。它的作用是
-            # 「两条一样相关的，先给还记得牢的那条」。
-            r["_score"] = (r["_rel"] * 2.0 + float(r.get("confidence", 0))
-                           + min(int(r.get("stability", 0)), 5) * 0.1
-                           + retention_score(r) * 0.3)
+                r["_rel_w"] = 0.0
+                base = (float(r.get("confidence", 0) or 0)
+                        + min(int(r.get("stability", 0) or 0), 5) * 0.1
+                        + retention_score(r) * 0.3)
+                w = _RESIDENT_WEIGHT.get(
+                    str(r.get("predicate") or "").strip(),
+                    _RESIDENT_WEIGHT_DEFAULT)
+                r["_score"] = base * w
+                r["_why"] = {"channel": "none", "bigram": 0, "idf": 0.0,
+                             "norm": 0.0, "intent": "", "mmr": "",
+                             "resident_w": w}
+            return sorted(rows, key=lambda r: r["_score"], reverse=True)
+        n = max(1, len(rows))
+        if self.idf_enabled:
+            w = {}
+            for g in qall:
+                df = sum(1 for s in grams if g in s)
+                w[g] = math.log(1.0 + n / (1.0 + df)) * (1.0 if g in qg else 0.4)
+        else:
+            w = {g: (2.0 if g in qg else 0.8) for g in qall}
+        intent_rel = bool(_REL_Q.search(query))
+        intent_time = bool(_TIME_Q.search(query))
+        intent_fact = bool(_FACT_Q.search(query))
+        rel_ws: list[float] = []
+        for r, tg, ctg in zip(rows, grams, cgrams):
+            hits = qall & tg
+            # 长 value 天然能蹭到更多 bigram，裸求和会让它永远压过
+            # 「喜欢喝拿铁」这种只命中一两个稀有词的短事实。按命中数做
+            # 次线性饱和：命中越多边际收益越低，短答案才有机会排上来。
+            rw = (sum(w.get(g, 0.0) for g in hits)
+                  / (1.0 + 0.35 * max(0, len(hits) - 1)))
+            rel_ws.append(rw)
+            r["_rel"] = len(hits)
+            r["_rel_content"] = len(qall & ctg)
+            r["_rel_w"] = rw
+        lo, hi = min(rel_ws, default=0.0), max(rel_ws, default=0.0)
+        span = hi - lo
+        concept = _CONCEPT_MARK in query
+        for r, rw in zip(rows, rel_ws):
+            norm = (rw - lo) / span if span > 0 else 0.0
+            conf = float(r.get("confidence", 0) or 0)
+            ret = retention_score(r)
+            bonus, why_intent = 0.0, ""
+            pv = f"{r.get('predicate') or ''}{r.get('value') or ''}"
+            if intent_rel and _REL_PRED.search(pv):
+                bonus, why_intent = 0.08, "relation"
+            elif intent_time and r.get("_rel_content"):
+                bonus, why_intent = 0.05 * min(1.0, ret), "time"
+            elif intent_fact and r.get("_rel_content"):
+                bonus, why_intent = 0.04, "fact"
+            r["_score"] = 0.70 * norm + 0.15 * conf + 0.15 * ret + bonus
+            ch = ("alias" if (qall & _bigrams(str(r.get("ask_alias") or "")))
+                  else "concept" if concept else "literal")
+            r["_why"] = {
+                "channel": ch, "bigram": int(r["_rel"]), "idf": round(rw, 3),
+                "norm": round(norm, 3), "confidence": round(conf, 3),
+                "retention": round(ret, 3), "intent": why_intent,
+                "bonus": round(bonus, 3), "mmr": "", "consensus": 0.0,
+                "score": round(float(r["_score"]), 4),
+            }
         return sorted(rows, key=lambda r: r["_score"], reverse=True)
+
+    def _apply_mmr(self, rows: list[dict], lam: float = 0.7) -> list[dict]:
+        """L2 之间去冗余：同一件事被总结成三条近重复会白占三个名额。
+
+        用 value + 问法别名的 bigram Jaccard 判重复；带独有数字的细节
+        （「九十分钟」）视为不同信息，不让位。纯 Python，零额外查询。
+        """
+        if not self.mmr_enabled or len(rows) < 2:
+            return rows
+        kept: list[dict] = []
+        kept_grams: list[set[str]] = []
+        kept_units: list[set[str]] = []
+        for r in rows:
+            text = f"{r.get('value') or ''}{r.get('ask_alias') or ''}"
+            g = _bigrams(text)
+            units = set(_NUM_RE.findall(text))
+            dup = False
+            for sg, su in zip(kept_grams, kept_units):
+                # 重叠系数（|交集| / 较短者）而不是 Jaccard：Jaccard 对
+                # 「同一句多几个字」惩罚太重，「喜欢喝拿铁」和「喜欢喝拿铁不加糖」
+                # 只有 0.67，永远判不成重复。骨架让位用的也是这一套。
+                shared = len(g & sg)
+                ov = shared / max(1, min(len(g), len(sg)))
+                if shared >= 2 and ov > lam and not (units - su):
+                    dup = True
+                    break
+            if dup:
+                r.setdefault("_why", {})["mmr"] = "duplicate"
+                continue
+            r.setdefault("_why", {})["mmr"] = "kept"
+            kept.append(r)
+            kept_grams.append(g)
+            kept_units.append(units)
+        return kept
 
     def _filter_by_relevance(self, rows: list[dict], query: str = "") -> list[dict]:
         """按本轮话题命中数砍掉「压根没被提到」的条目。
@@ -445,6 +594,8 @@ class PackBuilder:
                                      for r in picked):
                             # 语义命中也是 query 驱动的，算「被想起」，计数标记
                             r["_sem"] = True
+                            r.setdefault("_why", {})["sem"] = round(s, 3)
+                            r.setdefault("_why", {})["channel"] = "semantic"
                             # 抬 _score，避免这些行在 trim 阶段被当成最弱先裁掉；
                             # 但压在字面命中行之下（_rel>=1 意味着 _score>=2）
                             r["_score"] = max(float(r.get("_score", 0) or 0),
@@ -454,8 +605,26 @@ class PackBuilder:
             # 挑最可信的几条）。别整池子扔进去 —— 一句「在吗，今天干嘛呢」塞
             # 8 条无关事实，AI 会在一句打招呼里强行背资料卡。
             return rows[:keep]
-        th = max(1.0, top * self.rel_ratio)
+        # top 取自整个候选池（0.16.0 起不再预截断），一条长 value 蹭到 6~8
+        # 个 bigram 就能把阈值抬到 2.4，短答案只命中 1~2 个的会被误杀。
+        # 天花板按本轮 query 自己的 bigram 数算，再压一个绝对上限 3：
+        # 命中 3 个已经是强信号，再往上要求只会漏召回。放宽闸门不会把噪声
+        # 放进包——后面还有 _pick_l2 按 _score 取前 N 和预算裁剪。
+        qg = _bigrams(query)
+        cap = max(1, len(qg)) if qg else top
+        th = min(2.0, max(1.0, min(top, cap) * self.rel_ratio))
         kept = [r for r in rows if int(r.get("_rel", 0)) >= th]
+        # 短事实往往只有一两个 bigram 命中，可那可能正是答案本身。长噪声
+        # 把 top 撑高时，相对阈值等于宣布「短事实永不进包」。显式把内容
+        # 真的命中过的落选行按分数补回来，后面还有 _pick_l2 和预算裁剪，
+        # 不会因为放宽闸门把包撑大。
+        kept_ptr = {id(r) for r in kept}
+        weak = [r for r in rows if id(r) not in kept_ptr
+                and int(r.get("_rel_content") or 0) > 0]
+        if weak:
+            kept.extend(sorted(weak,
+                               key=lambda r: -float(r.get("_score") or 0))
+                        [:max(1, self.l2_keep_min)])
         if len(kept) >= min(self.l2_keep_min, len(rows)):
             return kept
         # 过滤太狠（只剩一两条）时补足到保底条数，取分最高的那几条。
@@ -474,6 +643,14 @@ class PackBuilder:
 
         所以先看头部里永久分类占了几条，不够就按分数从候选池补，
         挤掉末尾的非永久条目。挤的永远是排名最靠后的，不动相关性高的。
+
+        关键约束：腾槽位时绝不踢掉「本轮真的被提到」的相关事实
+        （_rel>0）。没有这条规定时，一个 query 命中的高相关非永久事实
+        （比如爱好=做音乐）会被硬生生挤掉去给一个零相关的永久事实（其他/
+        琐事）让位 —— 直接导致统计轨的 l2_rows 丢了它、topic_ids 变空、
+        _frozen_block 的话题刷新门因此永远不开，出现「输入做音乐却一点不更新」
+        的假象。query="" 的常驻包里所有事实 _rel 都是 0，这条约束自动失效，
+        永久槽位照常生效，行为不受影响。
         """
         if limit <= 0:
             return []
@@ -481,6 +658,9 @@ class PackBuilder:
 
         def _perm(r: dict) -> bool:
             return str(r.get("predicate") or "").strip() in PERMANENT_PREDICATES
+
+        def _relevant(r: dict) -> bool:
+            return int(r.get("_rel", 0) or 0) > 0
 
         quota = min(4, max(1, limit // 3))
         n_perm = sum(1 for r in head if _perm(r))
@@ -493,7 +673,11 @@ class PackBuilder:
         extra = extra[: quota - n_perm]
         keep = list(head)
         for r in extra:
-            victims = [i for i, x in enumerate(keep) if not _perm(x)]
+            # 只从「既非永久、又和本轮无关」的条目里挑受害者。若头部里
+            # 仅剩的相关事实都是非永久的，宁可永久槽位没填满，也绝不拿
+            # 它们去换一个零相关的永久事实。
+            victims = [i for i, x in enumerate(keep)
+                       if not _perm(x) and not _relevant(x)]
             if not victims:
                 break
             keep.pop(victims[-1])
@@ -515,18 +699,27 @@ class PackBuilder:
             hits = [r for _, r in scored[: self.l3_snippets]]
         return hits
 
-    def build(self, query: str = "", budget_tokens: int = 600) -> dict:
+    def build(self, query: str = "", budget_tokens: int = 600,
+              recent_queries: list[str] | None = None) -> dict:
         now = time.time()
         sub = self.subject or None
         sid = self.session_id
 
-        # 两条 query 并行：
-        #   q_raw —— 原话。问法判断（_asks_outbound_away / probe）必须用它，
-        #            概念词混进去会把「这不是在问转述吗」的判断带偏。
-        #   q     —— 检索文本。原话 + 概念归一词（expand_query），只给
-        #            _score_l2 / _filter_l3 / 渲染子项筛选用。
+        # 三条 query 各管各的，绝不混用：
+        #   q_raw   —— 本轮原话。问法判断（_asks_* / probe）只认它，历史消息和
+        #              概念词混进去会把「这句是不是在指代一条消息」判偏。
+        #   q       —— 本轮原话 + 概念归一词，主检索文本，也是渲染子项折叠的依据。
+        #   ctx     —— 最近几轮用户原话，只按 0.4 权重补召回（「那它呢」「刚才
+        #              那个」）。不进问法判断，也不进 pack["query"] 影响渲染。
         q_raw = str(query or "")
         q = expand_query(q_raw) if self.query_expand else q_raw
+        hist = [str(x).strip() for x in (recent_queries or []) if str(x).strip()]
+        if self.context_rounds > 0 and hist:
+            hist = hist[-self.context_rounds:]
+        else:
+            hist = []
+        ctx = " ".join(hist)
+        q_search = f"{ctx} {q}".strip() if ctx else q
 
         # 摘要优先取「本会话」那条（同一人可能有多个会话，别串）
         summary = ""
@@ -548,22 +741,34 @@ class PackBuilder:
             if srows:
                 summary = srows[0]["content"] or ""
 
-        l2_rows = [r for r in self.store.query_active_l2(subject=sub, limit=80)
-                   if not r.get("expires_at") or r["expires_at"] > now]
+        # 候选池：SQL 先按作用域 / 状态 / 有效期过滤，再按本轮相关度取，
+        # 不再先按置信度 LIMIT。老实现「confidence DESC ... LIMIT 80」会让
+        # 攒到 80 条以上的用户，低置信但本轮高度相关的事实永远进不了池。
+        # 问法为空（常驻包 / 面板预览）时 store 自动退回旧的置信度排序。
+        cand_lim = self.candidate_limit if self.candidate_limit > 0 else 100000
+
+        def _fetch(name):
+            try:
+                raw = self.store.query_active_l2(
+                    subject=name, limit=cand_lim, query=q_search,
+                    candidate_limit=cand_lim)
+            except TypeError:
+                try:
+                    raw = self.store.query_active_l2(subject=name, limit=cand_lim)
+                except TypeError:
+                    raw = self.store.query_active_l2(cand_lim)
+            return [r for r in raw
+                    if not r.get("expires_at") or r["expires_at"] > now]
+
+        l2_rows = _fetch(sub)
         for name in self.extra_subjects:
-            # 被点名的人：档案按「和这轮话的相关性」统一排序选出，所以候选
-            # 必须给够。此前 limit=8 且按置信度预排序——点名问「王五在不在
-            # 找工作」，跳槽条（conf 0.7）被 8 个高置信琐碎条挤出候选，
-            # 相关性排序根本没机会发力（压测抓到）。80 = 与主 subject 一致。
-            l2_rows.extend(
-                r for r in self.store.query_active_l2(subject=name, limit=80)
-                if not r.get("expires_at") or r["expires_at"] > now
-            )
-        l2_rows = self._score_l2(l2_rows, q)
-        # 先按相关性砍掉压根没被提到的，再截条数上限——反过来做的话，
-        # 12 条名额会被噪声占满，过滤等于白设
+            l2_rows.extend(_fetch(name))
+        l2_rows = self._score_l2(l2_rows, q, ctx)
+        # 先按相关性砍掉压根没被提到的，再去近重复、再截条数上限。
+        # 反过来做的话，12 条名额会被噪声占满，过滤等于白设。
         l2_pool = l2_rows
         l2_rows = self._filter_by_relevance(l2_pool, q_raw)
+        l2_rows = self._apply_mmr(l2_rows)
         l2_rows = self._pick_l2(l2_rows, l2_pool, self.l2_limit)
         # 点名保底：被点名的人（extra_subjects）至少 1 条档案进包。
         # 12 个名额可能被主人的事实挤满，那样「问 B 的事」时 AI 手里
@@ -589,13 +794,30 @@ class PackBuilder:
                 r.get("_sem")
                 or (int(r.get("_rel") or 0) > 0 and int(r.get("_rel_content") or 0) > 0)
             )
+        # 给每条候选打「这一轮进没进包」的标记。/糖记忆 why 要能解释的不只是
+        # 「排第几」，还有「为什么没进包」——落选行也必须留下排序明细。
+        _in_pack = {id(r) for r in l2_rows}
+        for _r in l2_pool:
+            _r.setdefault("_why", {})["in_pack"] = id(_r) in _in_pack
         # 统计轨早退：_count_hit 已经打好了，后面全是给「真正要注入的块」
         # 准备的重查询（l3 60 条 / 骨架 2000 条 / 外发池 / 跨会话池）。
         # lite 包不进 prompt、不裁剪、不渲染，只用来数提及度。
         if self.lite:
+            # 话题触发信号交给注入轨：本轮「真被想起」的事实 id 列表 +
+            # 是否出现指代 / 追问 / 回忆类问法。B 方案据此决定要不要在这一轮
+            # 刷新一次常驻包，没有信号时一个字节都不动。
             return {"l2": l2_rows, "l3": [], "outbound": [], "cross": [],
                     "skeleton": [], "summary": "", "excluded": [],
-                    "token_estimate": 0, "trim_notes": [], "_lite": True}
+                    "token_estimate": 0, "trim_notes": [], "_lite": True,
+                    "topic_ids": [r.get("id") for r in l2_rows
+                                  if r.get("_count_hit") and r.get("id")][:5],
+                    "topic_signal": bool(
+                        _asks_about_message(q_raw) or _PROBE_RE.search(q_raw)
+                        or _TIME_Q.search(q_raw)),
+                    "query_context": ctx,
+                    "why": {int(r["id"]): dict(r.get("_why") or {})
+                            for r in l2_pool if r.get("id")},
+                    "_l2_pool": l2_pool}
 
         # 保留 _score 给裁剪阶段用：预算不够时该按「和这轮话题有多相关」砍，
         # 而不是按置信度砍。否则「路人乙 是不是说过他叫滚木」这种问法，
@@ -619,7 +841,7 @@ class PackBuilder:
                 if str(r.get("session_id") or "") != sid
                 or now - float(r.get("created_at") or 0) > 900
             ]
-        l3_hits = self._filter_l3(l3_rows, q)
+        l3_hits = self._filter_l3(l3_rows, q_search)
         # 旧事骨架：只取当前说话人名下的（骨架跟着人走，跨人的是 cross 通道的事）
         skeletons: list = []
         if self.skeleton_limit and sub:
@@ -632,7 +854,7 @@ class PackBuilder:
                     event_type="l3_skeleton", subject=sub, bot_id=self.bot_id)
             except Exception:
                 srows = []
-            qg_skel = _bigrams(q) if q else set()
+            qg_skel = _bigrams(q_search) if q_search else set()
             if qg_skel:
                 for r in srows:
                     r["_skel_rel"] = len(qg_skel & _bigrams(str(r.get("content") or "")))
@@ -669,6 +891,19 @@ class PackBuilder:
                     self.skel_yielded += 1
                     continue  # 纯重复：L2 已逐字覆盖且无独有细节
                 skeletons.append(_s)
+        # 多通道共识：同一件事实在 L2、旧事骨架、L3 原话里都和本轮对上，
+        # 比单路命中可信得多。只给已进包的行加分，不改条数、不额外查库。
+        if l2_rows and (skeletons or l3_hits):
+            cg = _bigrams(" ".join(
+                [str(s.get("content") or "") for s in skeletons]
+                + [str(r.get("content") or "") for r in l3_hits]))
+            for r in l2_rows:
+                vg = _bigrams(f"{r.get('value') or ''}{r.get('ask_alias') or ''}")
+                if cg & vg and int(r.get("_rel") or 0) > 0:
+                    r["_score"] = float(r.get("_score") or 0) + 0.08
+                    r.setdefault("_why", {})["consensus"] = 0.08
+            l2_rows.sort(key=lambda r: -float(r.get("_score") or 0))
+
         excluded = self.store.recent_audit(limit=self.excluded_limit)
 
         # 跨会话：你自己主动发出去的话。不按 subject 过滤 —— 转述的本质就是
@@ -949,6 +1184,12 @@ class PackBuilder:
             "scope": {"subject": self.subject, "session_id": sid},
             "query": q,
             "query_raw": q_raw,
+            "query_context": ctx,
+            # 每条 L2 的排序明细：/糖记忆 why <id> 和面板据此解释
+            # 「为什么排第 3 / 为什么没进包」，不用再靠猜。
+            "why": {int(r["id"]): dict(r.get("_why") or {})
+                    for r in l2_pool if r.get("id")},
+            "_l2_pool": l2_pool,
             "l2": l2_rows,
             "identities": identities,
             "l3": [{"id": r["id"], "content": r["content"], "event_type": r["event_type"],

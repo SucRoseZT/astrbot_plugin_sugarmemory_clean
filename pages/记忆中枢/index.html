@@ -191,7 +191,11 @@
   .segbtn:hover { color:var(--text); }
   .segbtn.act { background:var(--acc); color:#fff; }
 
-  #packdetail { max-height:70vh; overflow:auto; }
+  /* 明细整块跟着页面一起滚：以前这里是 70vh 的独立滚动框，鼠标滚轮落在里面
+     只滚它自己，上面那堆「预览谁 / 模式 / 状态说明」纹丝不动地占着屏幕，
+     真正能看明细的区域被压得很小。改成不限高，交给外层 .scroll 统一滚。 */
+  #packdetail { overflow:visible; }
+  #packout { max-height:none; overflow:visible; }
   .pdsec { border:1px solid var(--line); border-radius:12px; background:var(--card); margin-bottom:10px;
     overflow:hidden; }
   .pdhead { display:flex; align-items:center; gap:8px; padding:9px 13px;
@@ -210,9 +214,10 @@
   .pdsub { color:var(--dim); font-size:11.5px; margin-top:2px; }
 
   /* 分类统计条：一眼看清这次注入每条通道给了多少条。
-     吸顶：往下翻明细时它一直挂着，随时能对上「刚才那节属于哪一类、总共几条」。 */
+     以前是 sticky 吸顶，「本次注入 N 条」那条会一直钉在顶上不跟着滚，把本来就
+     不高的可视区再吃掉一截 —— 现在改成普通流内块，往下翻就跟着一起走。 */
   .pdsum { border:1px solid var(--line); border-radius:12px; background:var(--card);
-    padding:10px 13px 11px; margin-bottom:10px; position:sticky; top:-1px; z-index:3;
+    padding:10px 13px 11px; margin-bottom:10px; position:relative; z-index:3;
     box-shadow:0 3px 10px rgba(226,150,182,.16); }
   .pdsumhead { display:flex; align-items:baseline; gap:8px; font-size:12.5px;
     color:var(--dim); margin-bottom:9px; flex-wrap:wrap; }
@@ -228,6 +233,38 @@
   .pdstat.zero { background:#f7f7f9; color:#b9b9c2; border-color:#ececf1; }
   .pdstat.zero:hover { border-color:#dcdce4; background:#f2f2f6; }
   .pdstat.cut { background:#fdf6ec; color:#a97b34; border-color:#f2e0c2; }
+
+  /* ---------- 冻结尾部模拟：多轮累计 + 缓存命中预估 ---------- */
+  #fqwrap { margin:0 0 12px; }
+  .fqsum { border:1px solid var(--line); border-radius:12px; background:var(--card);
+    padding:11px 13px; margin-bottom:10px; box-shadow:0 3px 10px rgba(226,150,182,.12); }
+  .fqsumrow { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;
+    font-size:12.5px; color:var(--dim); }
+  .fqsumrow b { font-size:13px; color:#c94f7c; font-weight:600; }
+  .fqbar { height:9px; border-radius:5px; background:#f3e6ec; overflow:hidden; margin:8px 0 6px; }
+  .fqbar > i { display:block; height:100%; background:linear-gradient(90deg,#6cc6a0,#4a9e7d);
+    transition:width .3s; }
+  .fqbar.low > i { background:linear-gradient(90deg,#e8b45f,#d98b3c); }
+  .fqrounds { display:flex; flex-direction:column; gap:8px; }
+  .fqround { border:1px solid var(--line); border-radius:11px; background:#fffafcd9; overflow:hidden; }
+  .fqh { display:flex; align-items:center; gap:7px; padding:8px 11px; flex-wrap:wrap;
+    background:linear-gradient(90deg,#fff2f8,#fff9fb); font-size:12.5px; }
+  .fqh .fqn { font-weight:600; color:#c94f7c; }
+  .fqh .fqq { color:var(--text); max-width:44%; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; }
+  .fqh .fqhit { margin-left:auto; font-variant-numeric:tabular-nums; }
+  .fqhit.ok { color:#3f9a76; }
+  .fqhit.warn { color:#b8842f; }
+  .fqtail { padding:6px 11px 9px; }
+  .fqrow { display:flex; gap:8px; align-items:flex-start; padding:4px 0; font-size:12.5px;
+    border-bottom:1px dashed #f3e2ea; }
+  .fqrow:last-child { border-bottom:0; }
+  .fqplus { flex:0 0 auto; color:#fff; background:#4a9e7d; border-radius:6px; font-size:10.5px;
+    padding:1px 6px; line-height:1.7; }
+  .fqempty { color:var(--dim); font-size:12px; padding:5px 0; }
+  .fqunion { border:1px dashed #e6c9d7; border-radius:10px; padding:9px 11px;
+    margin-bottom:10px; background:#fff7fb; }
+  .fqunion > b { color:#c94f7c; font-size:12.5px; display:block; margin-bottom:4px; }
 
   /* ---------- 分组：天 / 一次对话 / 一次总结 ---------- */
   .day { margin-bottom:12px; border:1px solid var(--line); border-radius:12px; background:#fffafcd9;
@@ -661,6 +698,76 @@
   .cfgstat.fail { color:#d0526b; }
   .cfgrow.flash { animation:cfgflash .7s ease; }
   @keyframes cfgflash { 0% { background:#fff3f8; } 100% { background:transparent; } }
+  /* 配置项模糊搜索 */
+  .cfgfindbar { display:flex; align-items:center; gap:9px; margin-bottom:9px; flex:none; }
+  .cfgfind { flex:0 1 360px; min-width:0; background:#fff; border:1px solid var(--line);
+    border-radius:999px; padding:6px 14px; font-size:12.5px; color:var(--text);
+    font-family:inherit; outline:none; transition:.14s; }
+  .cfgfind::placeholder { color:#cbb0bd; }
+  .cfgfind:focus { border-color:var(--acc); box-shadow:0 0 0 3px #ff7fa933; }
+  .cfgfindn { font-size:11.5px; color:#b98da0; }
+  .cfgfindn.hit { color:#c94f7c; font-weight:600; }
+  .cfgfindtip { margin-left:auto; font-size:11px; color:#d3b8c5; }
+  .cfgsec-t .cfgfindn { margin-left:8px; font-weight:400; }
+  .cfgrow.wide { flex-wrap:wrap; align-items:flex-start; }
+  .cfgrow.wide .cfgname { flex:1 1 100%; }
+  .cfgtxt { flex:1 1 100%; min-width:0; min-height:62px; resize:vertical;
+    background:#fff; border:1px solid var(--line); border-radius:9px; padding:7px 10px;
+    font-size:12.5px; line-height:1.7; color:var(--text); font-family:inherit;
+    outline:none; }
+  .cfgtxt:focus { border-color:var(--acc); box-shadow:0 0 0 3px #ff7fa933; }
+
+  /* ---------- 总结提示词 ----------
+     类名统一 sp 前缀 + 全部挂在 #subPrompt 下：pbar / pcol / pcard 这些裸类名
+     好感度和人物页早就在用，串味的后果是这里的标题行被压成 6px 的进度条。 */
+  #subPrompt .sprm-bar { display:flex; align-items:center; gap:9px; margin-bottom:9px; flex:none; }
+  #subPrompt .sprm-grow { flex:1; }
+  #subPrompt .sprm-stat { font-size:11.5px; color:#b98da0; }
+  #subPrompt .sprm-stat b { color:#c94f7c; }
+  #subPrompt .sprm-stat code { font-size:11px; color:#c3a5b3; }
+  #subPrompt .sprm-split { flex:1; min-height:0; display:flex; gap:13px; }
+  #subPrompt .sprm-col { flex:1 1 0; min-width:0; display:flex; flex-direction:column;
+    background:#fffdfb; border:1px solid var(--line); border-radius:14px;
+    padding:12px 14px; min-height:0; }
+  #subPrompt .sprm-col-h { display:flex; align-items:baseline; gap:8px; font-size:12px; color:#c94f7c;
+    margin-bottom:5px; flex:none; }
+  #subPrompt .sprm-col-h span { font-size:11px; color:#c3a5b3; font-weight:400; }
+  #subPrompt .sprm-help { font-size:11px; color:#b98da0; line-height:1.7; margin-bottom:8px; flex:none; }
+  #subPrompt .sprm-scroll { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain;
+    border-top:1px dashed #f7dbe7; padding-top:8px; }
+  #subPrompt .sprm-sec { border:1px solid #fbe9f0; border-radius:10px; margin-bottom:7px; background:#fff; }
+  #subPrompt .sprm-sec:last-child { margin-bottom:0; }
+  #subPrompt .sprm-sec-h { display:flex; align-items:center; gap:7px; cursor:pointer; padding:6px 10px;
+    font-size:12px; color:#8d6b7a; user-select:none; }
+  #subPrompt .sprm-sec-h:hover { color:#e2568a; }
+  #subPrompt .sprm-sec-h em { font-style:normal; font-size:10px; color:#fff; background:#ffc4d9;
+    border-radius:5px; padding:0 5px; line-height:1.7; flex:none; }
+  #subPrompt .sprm-sec-h .sprm-sec-n { margin-left:auto; font-size:10.5px; color:#cbb0bd; }
+  #subPrompt .sprm-sec-b { display:none; padding:2px 11px 9px; font-size:11.5px; line-height:1.85;
+    color:#5c4a52; white-space:pre-wrap; word-break:break-word;
+    font-family:ui-monospace,"Cascadia Code",Consolas,monospace; }
+  #subPrompt .sprm-sec.open .sprm-sec-b { display:block; }
+  #subPrompt .sprm-edit { flex:0 0 42%; min-height:110px; resize:none; background:#fff;
+    border:1px solid var(--line); border-radius:10px; padding:9px 11px; font-size:12.5px;
+    line-height:1.8; color:var(--text); font-family:inherit; outline:none; }
+  #subPrompt .sprm-edit:focus { border-color:var(--acc); box-shadow:0 0 0 3px #ff7fa933; }
+  #subPrompt .sprm-prev { flex:1; min-height:70px; overflow:auto; margin:0; background:#fff7fb;
+    border:1px solid #f7dbe7; border-radius:10px; padding:8px 11px; font-size:11.5px;
+    line-height:1.8; color:#7a5b69; white-space:pre-wrap; word-break:break-word;
+    font-family:ui-monospace,"Cascadia Code",Consolas,monospace; }
+  #subPrompt .sprm-em { color:#c94f7c; }
+  #subPrompt .sprm-full { display:none; flex:0 1 40%; min-height:110px; flex-direction:column;
+    margin-top:10px; background:#fffdfb; border:1px solid var(--line); border-radius:14px;
+    padding:11px 14px; }
+  #subPrompt .sprm-full.act { display:flex; }
+  #subPrompt .sprm-full-h { display:flex; align-items:center; gap:9px; font-size:12px; color:#c94f7c;
+    flex:none; margin-bottom:7px; }
+  #subPrompt .sprm-full-h span { font-size:11px; color:#c3a5b3; font-weight:400; }
+  #subPrompt .sprm-body { flex:1; min-height:0; overflow:auto; margin:0; font-size:11.5px;
+    line-height:1.85; color:#5c4a52; white-space:pre-wrap; word-break:break-word;
+    font-family:ui-monospace,"Cascadia Code",Consolas,monospace; }
+  #subPrompt .sprm-body .sprm-em { color:#c94f7c; font-weight:600; }
+  #subPrompt.act { display:flex; }
 
   /* ---------- 说明页：左右两栏 ---------- */
   .docwrap { flex:1; min-height:0; display:flex; flex-direction:column; }
@@ -1777,8 +1884,9 @@
               <code>inject_freeze_seconds</code> 秒或 <code>inject_freeze_rounds</code> 轮到点就会刷新流水、重建前缀。
               而且插件节流常<b>比 provider 的缓存寿命（常见 5 分钟~小时级）短得多</b>，等于主动把还能用的前缀废掉。
               L2 事实被改写会立即重建、好感跨阶段也会变。
+              <b>0.16.0 起话题命中也会重建一次</b>（记成 <code>reason=topic_hit</code>）：本轮真的捞到「常驻包之外、且和这句话相关」的事实时，才把那几条补进这一轮。只有指代追问、一条都没补到，或命中的全是包里已有的条目，都<b>不会</b>重建，不会白废前缀缓存。同一话题换个说法、补进来的还是同几条（或其子集）也继续复用；只有补进来的是完全不同的一组事实才算真换话题，此时不受 <code>inject_topic_min_interval</code>（默认 8 秒）防抖限制，立刻刷新。闲聊轮次完全不触发。这是拿一点点缓存换召回质量，属于预期行为。
             </div>
-            <div class="dk">怎么核对：明细的「重建」列，以及「重建轮 vs 同 fp 连续轮」分组；重建轮占比高就把节流调大（例如 600 秒 / 30 轮）再观察，别在没数据时拍脑袋调。</div>
+            <div class="dk">怎么核对：明细的「重建」列看 reason——<code>topic_hit</code> 是话题刷新、<code>l2_changed</code> 是真改了记忆、<code>aged</code>/<code>rounds</code> 是节流到点。<b>注入预览里「实际注入」和「即时候选」字节不一样时，先看状态栏有没有「本轮话题补入 #…」</b>：有就是话题库量差异，不是待生效的新内容；那条实时检索出来的统计轨本来就不进 prompt。重建轮占比高就把节流调大（例如 600 秒 / 30 轮）再观察；只想对照纯冻结可以把 <code>inject_topic_refresh</code> 关掉。</div>
           </div>
 
           <div class="docitem">
@@ -1866,18 +1974,69 @@
       <div class="cfgbar">
         <div class="subtabs" id="setTabs">
           <span class="subtab act" data-s="cfg">配置项</span>
+          <span class="subtab" data-s="prompt">总结提示词</span>
           <span class="subtab" data-s="doc">功能说明</span>
         </div>
         <span class="hint" id="cfgHint"></span>
       </div>
 
       <div class="subview act" id="subCfg">
+        <div class="cfgfindbar">
+          <input class="cfgfind" id="cfgFind" type="search" autocomplete="off"
+                 placeholder="模糊搜索：名字 / 键名 / 说明（如 缓存、预算）">
+          <span class="cfgfindn" id="cfgFindN"></span>
+          <span class="cfgfindtip" id="cfgFindTip">Esc 清空</span>
+        </div>
         <div class="scroll" id="cfgList"></div>
         <div class="cfgfoot">
           <button class="btn" id="cfgReload">重新读取</button>
           <button class="btn" id="cfgRetry" style="display:none">重试保存</button>
           <span class="hint" id="cfgStat"></span>
           <span class="hint" id="cfgPath"></span>
+        </div>
+      </div>
+
+      <div class="subview" id="subPrompt">
+        <div class="sprm-bar">
+          <span class="sprm-stat" id="pStat">读取中…</span>
+          <span class="sprm-grow"></span>
+          <button class="btn mini" id="pFullBtn">预览完整提示词</button>
+          <button class="btn mini" id="pResetBtn">清空追加</button>
+        </div>
+        <div class="sprm-split">
+          <div class="sprm-col">
+            <div class="sprm-col-h">
+              <b>主提示词 · 只读</b>
+              <span id="pBaseMeta"></span>
+            </div>
+            <div class="sprm-help">这是插件内置的总结规则，任何设置都改不到它。
+              要加自己的偏好，用右边「追加内容」——只往后加，不动这里一个字。</div>
+            <div class="sprm-scroll" id="pBase"></div>
+          </div>
+          <div class="sprm-col">
+            <div class="sprm-col-h">
+              <b>追加内容 · 可编辑</b>
+              <span id="pExtraMeta">0 字</span>
+            </div>
+            <div class="sprm-help">这段会接在主提示词最后一行之后，一起作为 system prompt
+              发给总结模型。停手约 1 秒自动保存；留空＝只用内置规则。</div>
+            <textarea class="sprm-edit" id="pExtra" spellcheck="false"
+                      placeholder="例如：游戏名一律保留原名，不要翻译；我的事只记事实，不要替我总结情绪。"></textarea>
+            <div class="sprm-col-h">
+              <b>实际发送的结尾</b>
+              <span>追加段 + 与内置规则的分界线</span>
+            </div>
+            <pre class="sprm-prev" id="pTmpl"></pre>
+          </div>
+        </div>
+        <div class="sprm-full" id="pFullWrap">
+          <div class="sprm-full-h">
+            <b>完整 system prompt（只读）</b>
+            <span id="pFullMeta"></span>
+            <span class="sprm-grow"></span>
+            <button class="btn mini" id="pFullClose">收起</button>
+          </div>
+          <pre class="sprm-body" id="pFullBody"></pre>
         </div>
       </div>
 
@@ -1896,7 +2055,7 @@
                   <span data-d="d5">人物身份</span>
                   <span data-d="d6">人际关系</span>
                   <span data-d="d8">群聊策略</span>
-                  <span data-d="d14">召回三层</span>
+                  <span data-d="d14">召回与排序</span>
                   <span data-d="d15">记忆生命周期</span>
                   <span data-d="d12">上手顺序</span>
                 </div>
@@ -1940,7 +2099,7 @@
                     <li><b>渲染</b>：拼成一段带标题的结构化文本写进系统提示</li>
                   </ul>
                   <p><b>作用域</b>：默认按人隔离，只取当前说话人的事实和本会话的摘要。关掉这个开关会变成全库检索，别人聊过的东西会跑到你的对话里，面板调试时才建议关。</p>
-                  <div class="doccall warn">用 2-gram 是因为它零成本、可解释、不会有假命中到离谱的程度。代价是<b>不懂同义</b>：你说「对象」，它翻箱倒柜也找不到「男朋友」那条。这个盲区后来靠<b>召回三层</b>补（见下面 07 节），但字面匹配本身还是这个脾气。</div>
+                  <div class="doccall warn">用 2-gram 是因为它零成本、可解释、不会有假命中到离谱的程度。代价是<b>不懂同义</b>：你说「对象」，它翻箱倒柜也找不到「男朋友」那条。这个盲区后来靠<b>召回补位 + 候选池 / 排序重做</b>补（见下面 07 节），但字面匹配本身还是这个脾气。</div>
                 </div>
 
                 <div class="docsec" id="d5">
@@ -1984,14 +2143,18 @@
                 </div>
 
                 <div class="docsec" id="d14">
-                  <h3><em>07</em>召回三层：改个说法也能翻到</h3>
-                  <p>上一节说过 2-gram 只认字面重合，网友实测下来最疼的就是这条：明明记过「20 岁」，你问「多大了」就是翻不到——改写过的问法十个里能召回的只有两三个。现在按「越便宜的越靠前」补了三层：</p>
+                  <h3><em>07</em>召回：改个说法也能翻到</h3>
+                  <p>2-gram 只认字面重合，最疼的就是「明明记过 20 岁，问『多大了』就是翻不到」。现在按「越便宜的越靠前」补了三层，另外把候选池和打分本身也修了：</p>
                   <ul>
                     <li><b>第一层 概念归一</b>（<code>pack_query_expand</code>，默认开）：一张手写映射表，把「多大了」「搞什么创作」这类口语问法先翻译成概念词（年龄 / 职业）再检索。零成本零延迟，代价是没进表的写法它管不了。</li>
                     <li><b>第二层 问法别名</b>（<code>alias_autogen</code>，默认开）：阶段总结时让模型给每条新事实顺手写几个「用户以后可能怎么问」的说法（「20 岁」→ 多大了 / 上大学没），存进库里的 <code>ask_alias</code> 列。检索时别名也参与打分，换个问法照样命中。存量旧事实会在之后的总结里分批补齐，不用手动动库。</li>
-                    <li><b>第三层 语义兜底</b>（<code>pack_semantic_fallback</code>，默认关）：前两层全零命中时，调 Provider 的向量接口按语义相似度挑保底事实。兜的是「库里的写法和你的问法完全两个字」的极端情况（经典案例：「打字很响的设备」→「机械键盘」）。依赖模型支持 embedding，不支持时自动静默跳过，等于没开。</li>
+                    <li><b>第三层 语义兜底</b>（<code>pack_semantic_fallback</code> + <code>semantic_provider_id</code>，默认关 / 留空）：前两层全零命中时按语义相似度挑保底事实，兜「打字很响的设备」→「机械键盘」这种完全不同字的改写。<b>必须自己填一个支持 embedding 的 Provider ID 才会通电</b>；没填就整条路零调用零开销，一点钱不花。异步 / 同步接口都认，超时（默认 1.5 秒）或报错自动退回字面路。</li>
+                    <li><b>地基：候选池 + 排序</b>（<code>pack_l2_candidate_limit</code>）：检索前先按（人 / 状态 / 有效期）过滤，<b>不再先按置信度取前 80</b>——以前攒到 80 条以上的用户，低置信但本轮正好相关的事实永远进不了池。挑出来后按 IDF 加权（「的/了/是」自动降权）、命中数做次线性饱和、在本轮查询内归一、按问法意图微调权重，同一件事被总结成三条近重复还会让位。</li>
+                    <li><b>短答案不会被长噪声判死</b>：相对阈值加了绝对上限 2，且「内容真的命中过、只是 bigram 数不够」的落选行会补回候选。以前一条长 value 蹭到 7 个 bigram 就能把门槛抬到 ≥3，「喜欢喝拿铁」只命中 1 个会被直接筛掉；命中数饱和也压住了长文本靠字数刷分的优势。</li>
+                    <li><b>指代补位</b>（<code>pack_context_rounds</code>，默认 3）：「那它呢」「刚才那个」本轮字面零命中，把最近几轮原话按 0.4 权重一起参与检索就能接上。只给检索用，不进问法判断、也不进注入块渲染。</li>
                   </ul>
-                  <div class="doccall">顺序是刻意的：越靠前越便宜。绝大多数问法第一层就解决了，第二层管住「总结里记过的事」，第三层只收尾。三层全开时离线评测的改写召回从 20% 提到 90% 以上；第三层不支持的模型关掉它，前两层照常工作。</div>
+                  <div class="doccall">顺序是刻意的：越靠前越便宜。绝大多数问法第一层就解决了，第二层管住「总结里记过的事」，第三层只收尾。现在 <code>/糖记忆 why &lt;id&gt;</code> 还能直接看到这条为什么排第 3、为什么没进包：命中数 / IDF / 归一 / 意图 / 去重 / 多通道共识 / 总分，全都摊开给你看，不用再靠猜。</div>
+                  <div class="doccall warn"><b>面板上有两条轨，别混着看。</b>「注入预览」上方的<b>实际注入</b>＝ AI 这一轮真正看到的字节（常驻底档 + 本轮话题补进来的几条）；下方<b>即时候选</b>＝不含增量的纯底档，只作对照。另外还有一条<b>统计轨</b>：每轮按你的原话实时检索，只用于提及计数、命中率归因和 <code>memory_search</code> 按需查，<b>不进 prompt</b>。看到「面板说命中了 3 条、AI 却没想起」时，先看状态栏有没有「本轮话题补入 #…」——有就说明那几条还没被判定为需要刷新，没进注入块。</div>
                 </div>
 
                 <div class="docsec" id="d15">
@@ -2016,9 +2179,11 @@
                 <div class="docsec" id="d12">
                   <h3><em>09</em>推荐的配置顺序</h3>
                   <ul>
-                    <li><b>先别开注入</b>。默认是影子模式：照常记录，AI 看不见。先跑几天，在面板里看记录得准不准</li>
-                    <li>觉得记得对，再开「注入记忆」。这时候 AI 才开始真的用上这些记忆</li>
+                    <li><b>装好就能用</b>。「注入记忆」现在是<b>默认开</b>的，测试期已经结束，不用再手动去开开关</li>
+                    <li>想先观察记得准不准，可以临时关成影子模式跑几天（只记不注入，提及计数照常），看完再开回来</li>
                     <li><b>只留一个记忆插件</b>。装了别的同类插件就关掉这个的注入，否则同样的内容会注入两遍，白烧 token</li>
+                    <li><b>「话题命中时刷新常驻包」保持开</b>。常驻包继续冻结吃满前缀缓存，只有真聊到包外相关记忆、或「那它呢 / 上次 / 刚才」这类追问时才补一次，闲聊轮次一个字节都不动。这是省 token 的关键，除非做 A/B 对照别关</li>
+                    <li>语义兜底不用管：没填 Provider ID 就完全不通电。想开再填一个便宜的向量模型，别拿贵模型干这个</li>
                     <li>主人权限按需开。开了「只限主人」，就要确认你自己在管理员里，或者把自己的号填进额外授权名单，不然连你自己都会被挡</li>
                     <li>总结专用模型可以挂个便宜的小模型。总结不追求质量，只追求把事记下来</li>
                   </ul>
@@ -2114,7 +2279,8 @@
                     <li><b>群聊没有说话人归属</b>，所以只读。这不是没做完，是不打算做</li>
                     <li><b>记忆包只按人隔离</b>。群里 A 提到 B 的事情，存下来挂在 B 名下，不会注入给 A</li>
                     <li><b>拿不到缓存命中数</b>，是框架层的解析问题，插件这边补不了</li>
-                    <li><b>字面匹配仍是地基</b>：召回三层（概念归一 / 问法别名 / 语义兜底）补住了大部分改写盲区，但没进映射表的口语、还没补上别名的旧事实仍可能漏召回；语义兜底默认关，要 Provider 支持向量才有效</li>
+                    <li><b>字面匹配仍是地基</b>：概念归一 / 问法别名 / 最近几轮补位 + IDF 排序补住了大部分改写盲区，但没进映射表的口语、还没补上别名的旧事实仍可能漏召回；语义兜底默认关，要自己填 <code>semantic_provider_id</code> 且 Provider 支持 embedding 才有效</li>
+                    <li><b>常驻包不是实时检索</b>：为了省前缀缓存，闲聊轮次沿用冻结包，只有话题命中 / 指代追问才增量刷新；话题刚切走时旧片段可能还留一小会儿（最多冻结 180 秒 / 12 轮）。要逐句实时检索只能切 <code>inject_mode=dynamic</code>，代价是缓存基本不命中</li>
                     <li><b>总结是单次调用</b>。返回的 JSON 解析失败会退避重试 3 次，三次都不行就跳过这一批，等下一批</li>
                     <li><b>面板里没有弹窗</b>。沙箱禁了系统的 alert / confirm，所以危险操作都是「点两次」确认</li>
                   </ul>
@@ -2131,6 +2297,7 @@
                   <p><b>建议一律在本面板里改</b>，尤其是这几组：记忆、注入、总结、好感度、主人权限。原因很实际：在这里改完立刻生效，你可以马上发一句话看效果；在官方页改完要重载，重载前那段时间面板显示的是新值、插件用的还是旧值，很容易以为「改了没用」。</p>
                   <div class="doccall">官方那个配置页只当兜底用：插件没启动、面板打不开、或者你把「记录聊天」关错了导致面板没数据的时候，才去那边改。</div>
                   <p>另外，官方配置页最顶上有条提示项（一项空字符串，叫「先读我」），它不参与任何逻辑，就是提醒你这件事，<b>不用填、也不用管</b>。</p>
+                  <p><b>「设置 → 总结提示词」是第三个入口</b>，只管一件事：给总结模型加你自己的规矩。左边是插件内置的总结提示词，<b>只读</b>——那部分是解析、门控、落库的前提，改了它等于换一套协议，所以没给编辑入口；右边是「追加内容」，会以「补充规则（本机主人追加，优先级高于上面所有规则）」的段头接在末尾，一起当 system prompt 发出去。停手约 1 秒自动保存，清空即回到出厂行为。它<b>不影响</b>每轮注入的记忆包字节，改完不用重载、也不会让前缀缓存失效。</p>
                 </div>
 
               </div>
@@ -3571,11 +3738,12 @@ function openGlobal(kind) {
           <option value="query">按句子模拟（旧动态包）</option>
         </select>
       </div>
-      <textarea class="big" id="query" placeholder="模拟一句用户的话（真实注入模式下不影响结果）"></textarea>
+      <textarea class="big" id="query" placeholder="填一句用户的话，就模拟「这一轮」：固定前缀一字不动，只在尾部追加本轮召回到的 L2（可多轮累计）。留空 = 看进程里真正挂着的那一块。"></textarea>
       <div id="packstate" class="hint" style="margin:8px 0 0;line-height:1.7"></div>
       <div class="filterbar" style="margin:10px 0 12px">
         <button class="btn primary" id="packbtn">生成预览</button>
         <button class="btn" id="detailbtn">只看读取明细</button>
+        <button class="btn" id="fqClear" style="display:none">清空累计</button>
         <button class="btn" id="sumbtn">手动总结一次</button>
         <span class="hint" id="packtok"></span>
       </div>
@@ -3583,12 +3751,26 @@ function openGlobal(kind) {
         <button class="segbtn act" data-seg="block">注入原文</button>
         <button class="segbtn" data-seg="detail">读取明细</button>
       </div>
+      <div id="fqwrap" style="display:none"></div>
       <pre id="packout">还没生成。</pre>
       <div id="packdetail" style="display:none"></div>`;
     fillPackSubjects();
-    $('#packbtn').onclick = genPack;
+    // 别直接挂 genPack：onclick 会把 PointerEvent 当第一个参数传进去，
+    // onlyDetail 恒为真 → 每次点「生成预览」都被切到「读取明细」。
+    $('#packbtn').onclick = () => genPack();
     $('#detailbtn').onclick = () => genPack(true);
     $('#sumbtn').onclick = manualSummary;
+    $('#fqClear').onclick = () => { fqReset(true); genPack(false, true); };
+    if ($('#packMode')) $('#packMode').onchange = () => {
+      const live = $('#packMode').value === 'live';
+      fqToggle(live);
+      fqReset(true);
+    };
+    if ($('#packSubject')) $('#packSubject').onchange = () => fqReset(true);
+    // 默认就是「真实注入（冻结包）」：尾部累计区直接摆出来，不再让用户
+    // 先去下拉里切一个额外的「冻结尾部模拟」分类。
+    fqToggle(true);
+    fqReset(false);
     document.querySelectorAll('#packseg .segbtn').forEach(b => {
       b.onclick = () => switchPackSeg(b.dataset.seg);
     });
@@ -3711,7 +3893,132 @@ function fillPackSubjects() {
   sel.value = cur;
 }
 
-async function genPack(onlyDetail) {
+/* ===== 真实注入（冻结包）里的「尾部增量」可视化 =====
+   不再是独立的第三种模式：就在「真实注入（冻结包）」里，上面那句用户原话
+   填了，就等于在**同一个冻结包**上模拟这一轮 —— 固定前缀一字不动，只在
+   尾部追加本轮召回到的 L2。每点一次「生成预览」＝再模拟一轮，逐轮列出
+   这一轮补进来的 L2，并用「与上一轮块的公共前缀」预估前缀缓存命中率。
+   「清空累计」把轮次清空、回到第 1 轮之前。 */
+let fqRounds = [];
+function estTok(s) {
+  s = String(s || '');
+  if (!s) return 0;
+  let cjk = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0x4e00 && c <= 0x9fff) cjk++;
+  }
+  return cjk + Math.floor((s.length - cjk) / 4);
+}
+function fqToggle(show) {
+  const w = $('#fqwrap'); if (w) w.style.display = show ? '' : 'none';
+  const c = $('#fqClear'); if (c) c.style.display = show ? '' : 'none';
+}
+function fqReset(clearBlock) {
+  fqRounds = [];
+  const w = $('#fqwrap');
+  if (w) w.innerHTML = '<div class="hint" style="margin:0">还没开始：在上面填一句用户的话、'
+    + '点「生成预览」＝ 第 1 轮；再填下一句再点＝ 第 2 轮，逐轮累计对比。'
+    + '留空生成则显示进程里真正挂着的那一块。</div>';
+  if (clearBlock) {
+    const out = $('#packout'); if (out) out.textContent = '还没生成。';
+    const tok = $('#packtok'); if (tok) tok.textContent = '';
+  }
+}
+function fqAddRound(q, d) {
+  const prev = fqRounds.length ? fqRounds[fqRounds.length - 1].block : '';
+  const cur = d.block || '';
+  let i = 0; const n = Math.min(prev.length, cur.length);
+  while (i < n && prev[i] === cur[i]) i++;
+  const hitTok = estTok(cur.slice(0, i));
+  const curTok = estTok(cur);
+  const hitPct = curTok ? Math.round(hitTok / curTok * 100) : 0;
+  // 常驻前缀（非尾部那几条）逐条比对，它才是「冻结有没有生效」的真指标。
+  // 整块 LCP 会被尾部召回的长度占比稀释——前缀一个字没动也只报 58%，
+  // 看着像没命中，其实要重算的只有最后那两三条。
+  const preIds = (d.l2 || []).filter(x => !x.tail)
+    .slice(0, d.prefix_count || 0).map(x => x.id);
+  const prevPre = fqRounds.length ? fqRounds[fqRounds.length - 1].preIds : null;
+  const preMoved = prevPre
+    ? preIds.filter((id, k) => id !== prevPre[k]).length : 0;
+  const tailTok = (d.tail_rows || [])
+    .reduce((a, x) => a + (Number(x.tokens) || 0), 0);
+  fqRounds.push({
+    q: q || '(空)', block: cur, tail: d.tail_rows || [],
+    curTok, hitTok, hitPct, newTok: Math.max(0, curTok - hitTok),
+    preIds, preMoved, tailTok,
+    prefixCount: d.prefix_count || 0, baseCount: d.base_count || 0,
+    tailCount: d.tail_count || 0,
+    l2Total: (d.l2 || []).length,
+    l2Cap: (d.l2_limit || 12) + (d.tail_k === undefined ? 3 : d.tail_k),
+    budget: d.budget || 0,
+    cold: !prev,
+  });
+  fqRender();
+}
+function fqRender() {
+  const w = $('#fqwrap'); if (!w) return;
+  if (!fqRounds.length) { fqReset(); return; }
+  const last = fqRounds[fqRounds.length - 1];
+  const seen = new Set(); const union = [];
+  for (const r of fqRounds) for (const t of r.tail) {
+    if (seen.has(t.id)) continue;
+    seen.add(t.id); union.push(t);
+  }
+  const stable = last.cold || last.preMoved === 0;
+  const low = !stable;
+  const overCap = last.l2Cap && last.l2Total > last.l2Cap;
+  const overBudget = last.budget && last.curTok > last.budget;
+  let html = '<div class="fqsum">'
+    + `<div class="fqsumrow"><b>第 ${fqRounds.length} 轮 · 本次注入 ${last.l2Total} 条 L2</b>`
+    + `<span>常驻 ${last.prefixCount} 条 · 本轮尾部 +${last.tailCount} 条`
+    + ` · 上限 ${last.l2Cap} 条${overCap ? ' <b style="color:#c0392b">已超上限!</b>' : '（命中上限也不增长）'}</span></div>`
+    + `<div class="fqsumrow"><span>块 ${last.curTok} tok`
+    + `${last.budget ? ` / 预算 ${last.budget}` : ''}`
+    + `${overBudget ? ' <b style="color:#c0392b">超预算!</b>' : '（硬顶，超了会裁）'}</span>`
+    + `<span>跨 ${fqRounds.length} 轮累计追加过 ${union.length} 条，但每轮只带最新的 ${last.tailCount} 条 —— 不累积</span></div>`
+    + `<div class="fqbar${low ? ' low' : ''}"><i style="width:${last.hitPct}%"></i></div>`
+    + `<div class="fqsumrow"><span class="fqhit ${low ? 'warn' : 'ok'}" style="font-weight:600">`
+    + (last.cold ? '冷启动（首次写入缓存）'
+      : stable ? `常驻前缀 ${last.prefixCount} 条逐字节未变`
+      : `⚠ 常驻前缀变动 ${last.preMoved} 条`)
+    + '</span>'
+    + `<span>整块命中预估 ${last.hitPct}% · 尾部约 ${last.tailTok} tok 需重算</span></div>`
+    + '</div>';
+  if (union.length) {
+    html += '<div class="fqunion"><b>跨轮追加过的 L2 并集（回看用，不进注入块）</b>'
+      + '<div class="hint" style="margin:0 0 6px">下面这些是「这几轮里先后被补进过尾部」的事实合集，'
+      + '只是让你回看聊过什么。真实注入每轮只带当轮那 '
+      + `${last.tailCount} 条，条数上限 ${last.l2Cap} 条，不会越攒越多。</div>`
+      + union.map(t => `<div class="fqrow"><span class="fqplus">+</span><span>#${t.id} ${esc(t.predicate)}：${esc(t.value)}</span></div>`).join('')
+      + '</div>';
+  }
+  html += '<div class="fqrounds">';
+  fqRounds.forEach((r, idx) => {
+    const ok = r.cold || r.preMoved === 0;
+    const cls = ok ? 'ok' : 'warn';
+    html += '<div class="fqround"><div class="fqh">'
+      + `<span class="fqn">第 ${idx + 1} 轮</span>`
+      + `<span class="fqq">「${esc(r.q)}」</span>`
+      + `<span class="fqhit ${cls}">${r.cold
+          ? '冷启动（首次写入缓存）'
+          : (ok
+              ? `常驻前缀 ${r.prefixCount} 条未变 · 整块 ${r.hitPct}%`
+              : `⚠ 前缀变动 ${r.preMoved} 条 · 整块 ${r.hitPct}%`)}</span>`
+      + '</div><div class="fqtail">';
+    html += r.tail.length
+      ? r.tail.map(t => `<div class="fqrow"><span class="fqplus">+</span><span>#${t.id} ${esc(t.predicate)}：${esc(t.value)}</span></div>`).join('')
+      : '<div class="fqempty">本轮没补新 L2（闲聊 / 无相关命中）——真实运行会沿用上一轮的尾巴，整块不变</div>';
+    html += '</div></div>';
+  });
+  html += '</div>';
+  w.innerHTML = html;
+  const out = $('#packout'); if (out) out.textContent = last.block || '（空）';
+  const tok = $('#packtok');
+  if (tok) tok.textContent = `第 ${fqRounds.length} 轮 · 冻结块 ${last.curTok} tok · 本轮尾部 +${last.tail.length} 条`;
+}
+
+async function genPack(onlyDetail, bare) {
   const out = $('#packout');
   out.textContent = '生成中…';
   $('#packtok').textContent = '';
@@ -3721,30 +4028,22 @@ async function genPack(onlyDetail) {
   const scope = rawSubject === '__all__' ? 'all' : (rawSubject ? 'one' : '');
   const subject = rawSubject === '__all__' ? '' : rawSubject;
   const mode = $('#packMode') ? $('#packMode').value : 'live';
+  // bare：清空累计后重新拉一次「真实注入」的那一块，忽略输入框里还留着的句子。
+  const q = bare ? '' : ($('#query').value || '').trim();
   try {
     const d = await apiPost('api/pack', {
-      query: $('#query').value.trim(),
+      query: q,
       subject: subject,
       scope: scope,
       mode: mode,
     });
     renderPackState(d);
-    $('#packtok').textContent = `${d.mode === 'live' ? '实际注入' : '模拟'} 约 ${d.token_estimate} tokens` +
-      (d.relation_tokens ? `（记忆 ${d.memory_tokens} ＋ 关系 ${d.relation_tokens}）` : '') +
-      (d.scope === 'all' ? '｜全库混合（会串台，仅调试）'
-        : (d.subject ? `｜${d.subject}${d.subject_auto ? '（自动锁定）' : ''}` : '')) +
-      (d.session_id ? `｜会话 ${d.session_id}` : '｜未指定会话');
-    const parts = [];
-    if (d.mode === 'live') {
-      // 冻结包已经把关系快照拼在同一块里，别再单独追加一遍
-      parts.push(d.block || '（记忆包是空的：库里还没有能注入的内容）');
-      if (d.cache && d.cache.pending_change && d.candidate_block) {
-        parts.push('');
-        parts.push('──── 以下为节流期尚未生效的「即时候选」，TTL 到期 / 聊满轮数后才换上 ────');
-        parts.push(d.candidate_block);
-      }
-    } else {
-      parts.push(d.block || '（记忆包是空的：库里还没有能注入的内容）');
+    renderPackDetail(d);
+
+    // 旧动态包：纯对照，不代表真正注入的内容。
+    if (mode === 'query') {
+      fqReset(false);
+      const parts = [d.block || '（记忆包是空的：库里还没有能注入的内容）'];
       if (d.relation_block) {
         parts.push('');
         parts.push(d.relation_block);
@@ -3752,9 +4051,43 @@ async function genPack(onlyDetail) {
         parts.push('');
         parts.push('（这个人还没有关系记录，关系快照为空，不占 token）');
       }
+      out.textContent = parts.join('\n');
+      $('#packtok').textContent = `模拟 约 ${d.token_estimate} tokens` +
+        (d.relation_tokens ? `（记忆 ${d.memory_tokens} ＋ 关系 ${d.relation_tokens}）` : '') +
+        (d.scope === 'all' ? '｜全库混合（会串台，仅调试）'
+          : (d.subject ? `｜${d.subject}${d.subject_auto ? '（自动锁定）' : ''}` : ''));
+      if (onlyDetail) switchPackSeg('detail');
+      return;
+    }
+
+    // 真实注入（冻结包）：填了句子＝在同一个冻结包上模拟这一轮（尾部追加），
+    // 留空＝进程里真正挂着的那一块。
+    if (d.simulated) {
+      fqAddRound(q, d);
+      if (onlyDetail) switchPackSeg('detail');
+      return;
+    }
+    fqReset(false);
+    const parts = [d.block || '（记忆包是空的：库里还没有能注入的内容）'];
+    if (d.sim_error) {
+      parts.unshift('⚠ ' + d.sim_error);
+      parts.unshift('');
+    }
+    if (d.cache && d.cache.pending_change && d.candidate_block) {
+      parts.push('');
+      parts.push('──── 以下为节流期尚未生效的「即时候选」，TTL 到期 / 聊满轮数后才换上 ────');
+      parts.push(d.candidate_block);
+    } else if (d.cache && d.cache.topic_active && d.candidate_block) {
+      parts.push('');
+      parts.push('──── 以下为不含本轮话题增量的「纯常驻底档」，仅作对照，不是待换入的新内容 ────');
+      parts.push(d.candidate_block);
     }
     out.textContent = parts.join('\n');
-    renderPackDetail(d);
+    $('#packtok').textContent = `实际注入 约 ${d.token_estimate} tokens` +
+      (d.relation_tokens ? `（记忆 ${d.memory_tokens} ＋ 关系 ${d.relation_tokens}）` : '') +
+      (d.scope === 'all' ? '｜全库混合（会串台，仅调试）'
+        : (d.subject ? `｜${d.subject}${d.subject_auto ? '（自动锁定）' : ''}` : '')) +
+      (d.session_id ? `｜会话 ${d.session_id}` : '｜未指定会话');
     if (onlyDetail) switchPackSeg('detail');
   } catch (e) {
     out.textContent = '生成失败：' + (e.message || e);
@@ -3775,25 +4108,45 @@ function renderPackState(d) {
   }
   const f = d.freeze || {}, c = d.cache || {};
   const bits = [`<b>${f.mode === 'dynamic' ? '动态包（对照 / 回退）' : '常驻冻结包'}</b> · 预算上限 ${f.budget ?? '-'} tok · 实际 ${d.token_estimate} tok`];
+  if (d.simulated) {
+    bits.unshift(`<b>本轮尾部模拟</b>：块 = 常驻前缀 ${d.prefix_count ?? '-'} 条（逐字节不动）`
+      + ` ＋ 本轮从尾部追加 ${d.tail_count ?? 0} 条 L2（渲染在整块最末尾）。`
+      + `主指标看「常驻前缀 N 条逐字节未变」，那才是冻结真正生效的部分；`
+      + `整块命中率会被尾部长度占比稀释，只作参考。`
+      + `这只是「填了这句话之后应该注入成什么样」，<b>不会</b>写运行缓存、也<b>不会</b>推进节流轮数；`
+      + `把输入框清空再生成，看到的就是进程里此刻真正挂着的那一块。`);
+  }
   if (f.mode === 'dynamic') bits.push('⚠ 当前 inject_mode=dynamic：按本轮原话实时检索，不冻结、前缀缓存基本不命中，仅用于 A/B 对照或紧急回退');
   if (f.cfg_fp) bits.push(`<span style="opacity:.7">配置指纹 ${esc(f.cfg_fp)} · 改影响 prompt 的配置会统一失效全部分片（只失效一次）</span>`);
   if (!f.inject_enabled) bits.push('⚠ 注入总闸（inject_enabled）关着，实际不会注入任何内容');
   if (!f.dedup) bits.push('⚠ 节流已关（inject_dedup=false），每轮都会重新生成常驻包');
-  if (!c.exists) {
+  bits.push(f.topic_refresh === false
+    ? '话题刷新已关：走纯冻结常驻包，本轮原话一概不影响 prompt'
+    : `<span style="opacity:.7">话题刷新已开：闲聊沿用同一份前缀；聊到包外相关记忆才补最多 ${f.topic_extra ?? 3} 条进这一轮（reason=topic_hit）。同一话题换说法不重建，真换话题不受 ${f.topic_min_interval ?? 8}s 防抖限制</span>`);
+  if (!d.simulated && !c.exists) {
     bits.push(esc(c.hint || '运行时还没有这个（人,会话）的缓存：重载插件后，这个人第一次说话时建立。'));
     bits.push('下面显示的是即时候选包。');
-  } else {
+  } else if (!d.simulated) {
     bits.push(`当前块 ${c.block_tokens} tok · 已用 ${c.rounds}/${c.max_rounds} 轮 · 已冻结 ${c.age_seconds}s/${c.ttl_seconds}s`);
+    if (c.topic_active) {
+      const ids = (c.topic_ids || []).length
+        ? `本轮话题补入 #${(c.topic_ids || []).join(' #')}` : '本轮话题增量激活';
+      bits.push(`<span style="color:#4a9">◆ ${esc(ids)}</span>：当前块 = 常驻底档 + 这几条，下方纯底档与它字节不同是正常的，<b>不是</b>「有新内容待换入」`);
+    }
     if (c.pending_change) {
       bits.push(`⚠ 检测到新内容，<b>节流中</b>：继续用旧包保住前缀缓存，最快 ${c.seconds_left}s 或再聊 ${c.rounds_left} 轮后换上（候选 ${d.candidate_tokens} tok，已附在下方）`);
-    } else {
+    } else if (!c.topic_active) {
       bits.push('✓ 候选与当前块一致，system_prompt 字节稳定，前缀缓存可命中');
     }
   }
   if ((d.trim_notes || []).length) {
     bits.push(`⚠ 预算触发了 ${d.trim_notes.length} 处裁剪：超预算时 trim 会「突破保底」把 L2 砍到 1 条，建议调大 inject_budget_tokens`);
   }
-  bits.push('<span style="opacity:.8">读取明细来自即时候选包；输入的句子只影响提及统计与 memory_search 按需检索。</span>');
+  bits.push(d.simulated
+    ? '<span style="opacity:.8">「读取明细」列的是<b>不含本轮尾部增量</b>的纯底档（前缀就是从它取的）；'
+      + '尾部追加的那几条在上面「本轮追加的 L2」里逐条列着。你输入的句子还会另跑一次实时检索（统计轨），'
+      + '那条不进 prompt，别把两者当成同一份。</span>'
+    : '<span style="opacity:.8">上方「实际注入」＝ AI 真正看到的字节；下方「读取明细」与「即时候选」来自不含话题增量的纯底档。你输入的句子还会另跑一次实时检索（统计轨），那条不进 prompt，别把两者当成同一份。</span>');
   el.innerHTML = bits.join('<br>');
 }
 
@@ -4010,10 +4363,13 @@ function renderPackDetail(d) {
     ? (typeof labelOf === 'function' ? labelOf(scope.subject) : scope.subject)
     : '全库（会串台，仅调试用）';
   const head = `<div class="pdsum">
-    <div class="pdsumhead"><b>本次注入 ${total} 条</b>
+    <div class="pdsumhead"><b>${d.simulated ? '本次底档' : '本次注入'} ${total} 条</b>
       <span class="pdwho">· ${esc(who)}</span>
       <span class="pdsumtok" title="${esc(scope.session_id ? '会话 ' + scope.session_id : '未指定会话')}">
-        约 ${d.token_estimate || 0} tokens</span></div>
+        约 ${(d.simulated ? (d.candidate_tokens || 0) : (d.token_estimate || 0))} tokens</span></div>
+    ${d.simulated
+      ? `<div class="pdsub" style="margin:0 0 8px">这一栏是不含本轮尾部增量的纯底档；实际注入块 = 这份底档的固定前缀 ＋ 本轮尾部追加的 ${d.tail_count ?? 0} 条。</div>`
+      : ''}
     <div class="pdchips">${chips}</div></div>`;
 
   if (!blocks.length) {
@@ -4105,7 +4461,7 @@ async function loadOverview() {
     let modeText;
     if (on && rel) {
       modeText = '注入中 · 记忆 + 关系都进 prompt';
-      m.title = '已开启注入：每次对话前把记忆包和关系快照写进 system prompt';
+      m.title = '注入记忆默认开启：每次对话前把记忆包和关系快照写进 system prompt；常驻包按话题命中增量刷新，闲聊轮次沿用同一份前缀';
     } else if (on) {
       modeText = '注入中 · 只注记忆（关系功能关闭）';
       m.title = '记忆包正常注入；人际关系网总开关没开，关系不进 prompt。要连关系一起注入去配置「人际关系」组开总开关';
@@ -4114,7 +4470,7 @@ async function loadOverview() {
       m.title = '记忆包不注入，但每次对话会带一小段「你和这人什么关系」（约几十 token）；想连记忆一起注入去配置里开「注入记忆」';
     } else {
       modeText = '影子模式 · 只记不注入';
-      m.title = '记忆和关系都不进 prompt；想生效去插件配置里打开「注入记忆」（关系快照在「人际关系」组里单独开关）';
+      m.title = '注入记忆默认是开的，这里是被手动关成了影子模式：只记不注入。想生效去插件配置里打开「注入记忆」（关系快照在「人际关系」组里单独开关）';
     }
     m.innerHTML = `<i></i>${modeText}`;
     $('#auditCount').textContent = (o.deny_count + o.transform_count) || '';
@@ -4179,12 +4535,17 @@ const MODS = {
 };
 let curMod = 'home';
 
-/* 设置页里的两个子页：配置项 / 功能说明 */
+/* 设置页里的三个子页：配置项 / 总结提示词 / 功能说明 */
 function setSetTab(name) {
   document.querySelectorAll('#setTabs .subtab').forEach(t => t.classList.toggle('act', t.dataset.s === name));
   $('#subCfg').classList.toggle('act', name === 'cfg');
+  $('#subPrompt').classList.toggle('act', name === 'prompt');
   $('#subDoc').classList.toggle('act', name === 'doc');
   if (name === 'cfg') { syncCfgFoot(); $('#cfgHint').textContent = '改哪存哪，不用点保存'; }
+  else if (name === 'prompt') {
+    $('#cfgHint').textContent = '主提示词只读；只有「追加内容」会被拼到末尾发出去';
+    loadPrompt();
+  }
   else {
     $('#cfgHint').textContent = '看完切回「配置项」就能改';
     $('#subDoc').querySelectorAll('.docscroll').forEach(s => { s.scrollTop = 0; });
@@ -4197,6 +4558,7 @@ async function gotoMod(m) {
   // 离开总配置页前先把攒着的改动落盘，免得切个 tab 就丢
   if (curMod === 'config' && m !== 'config') {
     try { await flushCfg(); } catch (e) {}
+    try { await pFlush(); } catch (e) {}
   }
   const meta = MODS[m] || MODS.home;
   curMod = m;
@@ -5940,6 +6302,14 @@ function cfgRow(it) {
       <span class="cfgstat"></span>
     </div>`;
   }
+  // 长文本（提示词追加这类）单行输入框没法看，撑成药丸形更糟，改多行文本域
+  if (it.multiline) {
+    return `<div class="cfgrow wide">${name}
+      <textarea class="cfgtxt" data-k="${esc(it.key)}" data-t="str"
+        rows="3" placeholder="留空 = 只用内置内容">${esc(it.value || '')}</textarea>
+      <span class="cfgstat"></span>
+    </div>`;
+  }
   return `<div class="cfgrow">${name}
     <input class="cfgtext" type="text" data-k="${esc(it.key)}" data-t="str"
       value="${esc(it.value || '')}" placeholder="留空 = 用当前对话模型">
@@ -5947,21 +6317,96 @@ function cfgRow(it) {
   </div>`;
 }
 
-function renderCfg() {
+/* ---------------- 配置项模糊搜索 ----------------
+   只搜不筛库：命中分 = 各字段里最好的那个分数，标签权重最高。
+   子串命中（含中文）按「越靠前越高」计分；子串不中才退到子序列匹配，
+   这样打 "cach" 或 "缓存" 都能中，打错顺序也还能找到点东西。 */
+let cfgQuery = '';
+
+function fzHit(text, q) {
+  const h = String(text || '').toLowerCase();
+  if (!h || !q) return 0;
+  const at = h.indexOf(q);
+  if (at >= 0) return 100 - Math.min(28, at) + Math.min(12, q.length);
+  let i = 0, last = -2, sc = 0;
+  for (const ch of q) {
+    const idx = h.indexOf(ch, i);
+    if (idx < 0) return 0;
+    sc += (idx === last + 1 ? 3 : 1);
+    if (idx === 0) sc += 2;
+    last = idx;
+    i = idx + 1;
+  }
+  return sc;
+}
+
+function cfgScore(it, q) {
+  return Math.max(
+    fzHit(it.label, q) * 3.2,
+    fzHit(it.key, q) * 2.2,
+    fzHit(it.group, q) * 1.1,
+    fzHit(it.hint, q) * 1.0,
+  );
+}
+
+/* 重渲染会重建控件，先把还没保存的改动抓成快照，渲染完再填回去 ——
+   否则搜一下就把正在改的数字冲回旧值了。 */
+function cfgSnapshot() {
+  const m = {};
+  $('#cfgList').querySelectorAll('[data-k]').forEach(el => { m[el.dataset.k] = cfgReadEl(el); });
+  return m;
+}
+
+function cfgRestore(m) {
+  const keys = Object.keys(m || {});
+  if (!keys.length) return;
+  keys.forEach(k => {
+    const el = $(`#cfgList [data-k="${k}"]`);
+    const it = cfgItems.find(x => x.key === k);
+    if (!el || !it) return;
+    const v = m[k], t = el.dataset.t;
+    const same = t === 'bool' ? v === !!it.value
+      : (t === 'int' ? v === Number(it.value || 0) : v === String(it.value ?? ''));
+    if (same) return;                       // 没改过就别碰，免得点亮「待存」
+    if (t === 'bool') el.checked = !!v; else el.value = v;
+  });
+}
+
+function renderCfg(keepEdits) {
+  const q = cfgQuery.trim().toLowerCase();
   const order = [];
   const map = new Map();
   const subt = {};
+  const best = {};
   for (const it of cfgItems) {
+    const sc = q ? cfgScore(it, q) : 1;
+    if (q && sc <= 0) continue;
     if (!map.has(it.group)) { map.set(it.group, []); order.push(it.group); }
-    map.get(it.group).push(it);
+    map.get(it.group).push({ it, sc });
     if (!(it.group in subt)) subt[it.group] = it.group_hint || '';
+    best[it.group] = Math.max(best[it.group] || 0, sc);
   }
-  $('#cfgList').innerHTML = linkPanelHtml() + order.map(g => `
-    <div class="cfgsec">
-      <div class="cfgsec-t">${esc(g)}</div>
+  let total = 0;
+  order.forEach(g => { total += map.get(g).length; });
+  if (q) order.sort((a, b) => best[b] - best[a]);
+  const body = order.map(g => {
+    const rows = q ? map.get(g).slice().sort((a, b) => b.sc - a.sc) : map.get(g);
+    return `<div class="cfgsec">
+      <div class="cfgsec-t">${esc(g)}${q ? `<span class="cfgfindn">${rows.length} 项</span>` : ''}</div>
       ${subt[g] ? `<div class="cfgsec-hint">${esc(subt[g])}</div>` : ''}
-      ${map.get(g).map(cfgRow).join('')}
-    </div>`).join('');
+      ${rows.map(r => cfgRow(r.it)).join('')}
+    </div>`;
+  }).join('');
+  const snap = keepEdits ? cfgSnapshot() : null;
+  $('#cfgList').innerHTML = (q ? '' : linkPanelHtml())
+    + (body || `<div class="empty">没有匹配「${esc(cfgQuery)}」的配置项
+        <small>换个词试试：缓存 / 预算 / 召回 / 好感 / 提示词。Esc 清空搜索</small></div>`);
+  if (!q) { const n = $('#cfgFindN'); if (n) { n.textContent = `${cfgItems.length} 项`; n.classList.remove('hit'); } }
+  else {
+    const n = $('#cfgFindN');
+    if (n) { n.textContent = total ? `匹配 ${total} / ${cfgItems.length} 项` : `无匹配`; n.classList.toggle('hit', total > 0); }
+  }
+  cfgRestore(snap);
 }
 
 function cfgReadEl(el) {
@@ -6074,6 +6519,161 @@ $('#cfgReload').onclick = async () => {
   await loadCfg();
   toast('已重新读取');
 };
+
+/* 搜索：只重排/隐藏，不重建数据；打字时先把未保存的改动快照保住 */
+(function bindCfgFind() {
+  const el = $('#cfgFind');
+  if (!el) return;
+  el.addEventListener('input', () => {
+    cfgQuery = el.value || '';
+    renderCfg(true);          // 保留还没保存的改动
+  });
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      el.value = ''; cfgQuery = '';
+      renderCfg(true);
+    }
+  });
+})();
+
+/* ================= 总结提示词（只读主提示词 + 可追加） ================= */
+
+let pData = null;
+let pSaved = '';
+let pTimer = 0;
+let pSeq = 0;
+let pFail = false;
+
+async function loadPrompt(force) {
+  try {
+    if (!pData || force) pData = await apiGet('api/summary_prompt');
+    pSaved = String(pData.extra || '');
+    const ta = $('#pExtra');
+    if (ta && document.activeElement !== ta) ta.value = pSaved;
+    pFail = false;
+    pRenderBase();
+    pRefreshTail();
+    $('#pStat').innerHTML = `内置 <b>${pData.tokens.base}</b> tok · 追加 <b>${pData.tokens.extra || 0}</b> tok`
+      + ` · 合计 <b>${pData.tokens.effective}</b> tok · 指纹 <code>${esc(pData.hash)}</code>`;
+  } catch (e) {
+    const st = $('#pStat');
+    if (st) st.textContent = '读取失败：' + (e.message || e);
+  }
+}
+
+function pRenderBase() {
+  if (!pData) return;
+  const secs = pData.sections || [];
+  $('#pBase').innerHTML = secs.map((s, i) => `
+    <div class="sprm-sec${i === 0 ? ' open' : ''}">
+      <div class="sprm-sec-h"><em>${i + 1}</em>${esc(s.title)}<span class="sprm-sec-n">${s.body.length} 字</span></div>
+      <div class="sprm-sec-b">${esc(s.body)}</div>
+    </div>`).join('');
+  $('#pBase').querySelectorAll('.sprm-sec-h').forEach(h => {
+    h.onclick = () => h.parentElement.classList.toggle('open');
+  });
+  $('#pBaseMeta').textContent = `${pData.chars.base} 字 · 约 ${pData.tokens.base} tok`;
+}
+
+/* 尾部预览：只显示「真正会被追加的那一段」，不重复左边那一大坨 */
+function pRefreshTail() {
+  if (!pData) return;
+  const extra = String(($('#pExtra') || {}).value || '');
+  const trimmed = extra.trim();
+  const box = $('#pTmpl');
+  if (box) {
+    box.innerHTML = trimmed
+      ? `<span class="sprm-em">${esc(pData.header.trim())}</span>\n${esc(extra)}`
+      : '<span style="color:#cbb0bd">没有追加内容 —— 系统只发送左边那份内置提示词，'
+        + '一个字都不多。</span>';
+  }
+  const meta = $('#pExtraMeta');
+  if (meta) meta.textContent = trimmed ? `${trimmed.length} 字 · 约 ${estTok(extra)} tok` : '空';
+  pSyncFull();
+}
+
+function pSyncFull() {
+  if (!pData) return;
+  const extra = String(($('#pExtra') || {}).value || '');
+  const trimmed = extra.trim();
+  const body = pData.base
+    + (trimmed ? '\n\n' : '')
+    + (trimmed ? `<span class="sprm-em">${esc(pData.header.trim())}</span>\n${esc(extra)}` : '');
+  const full = $('#pFullBody');
+  if (full) full.innerHTML = body;
+  const meta = $('#pFullMeta');
+  if (meta) meta.textContent = `${pData.base.length + (trimmed ? extra.length : 0)} 字 · 约 `
+    + `${estTok(pData.base) + (trimmed ? estTok(extra) : 0)} tok`;
+}
+
+function pQueue() {
+  clearTimeout(pTimer);
+  pTimer = setTimeout(() => pFlush(), 800);
+}
+
+async function pFlush() {
+  clearTimeout(pTimer);
+  pTimer = 0;
+  if (!pData) return;
+  const ta = $('#pExtra');
+  if (!ta) return;
+  const now = String(ta.value || '').trim();
+  if (now === pSaved.trim()) return;
+  const seq = ++pSeq;
+  const st = $('#pStat');
+  if (st) st.textContent = '保存中…';
+  try {
+    await apiPost('api/config/set', { patch: { summary_prompt_extra: now } });
+    if (seq !== pSeq) return;                 // 有更新的请求在飞，别拿旧结果覆盖
+    pFail = false;
+    // 重新拉一次：段头/字数/token/指纹全由后端算，前端不复刻规则
+    await loadPrompt(true);
+    const it = cfgItems.find(x => x.key === 'summary_prompt_extra');
+    if (it) it.value = now;
+    const s2 = $('#pStat');
+    if (s2) s2.innerHTML += ' · <span style="color:#3f9a6d">已保存</span>';
+  } catch (e) {
+    pFail = true;
+    if (st) st.innerHTML = `<span style="color:#d0526b">保存失败：${esc(e.message || e)}</span>`;
+    toast(e.message || '保存失败', true);
+  }
+}
+
+(function bindPrompt() {
+  const ta = $('#pExtra');
+  if (ta) {
+    ta.addEventListener('input', () => { pRefreshTail(); pQueue(); });
+    ta.addEventListener('blur', () => { pFlush(); });
+    // Tab 在文本域里应该是缩进，不是跳走；这里留个 4 空格，写规则时对齐方便
+    ta.addEventListener('keydown', e => {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const s = ta.selectionStart, t = ta.selectionEnd;
+        ta.value = ta.value.slice(0, s) + '    ' + ta.value.slice(t);
+        ta.selectionStart = ta.selectionEnd = s + 4;
+        pRefreshTail(); pQueue();
+      }
+    });
+  }
+  const fb = $('#pFullBtn');
+  if (fb) fb.onclick = async () => {
+    await loadPrompt(false);
+    $('#pFullWrap').classList.toggle('act');
+    pSyncFull();
+  };
+  const fc = $('#pFullClose');
+  if (fc) fc.onclick = () => $('#pFullWrap').classList.remove('act');
+  const rb = $('#pResetBtn');
+  if (rb) rb.onclick = async () => {
+    const ta2 = $('#pExtra');
+    if (!ta2 || !ta2.value) { toast('追加内容已经是空的'); return; }
+    ta2.value = '';
+    pRefreshTail();
+    await pFlush();
+    toast('已清空追加内容');
+  };
+})();
 
 pplSwitch('people');
 switchRel('graph');
@@ -6238,7 +6838,8 @@ function gdPrevInner() {
   } else if (c.exists) {
     state = `<b>真实注入</b>：这份常驻包已挂了 ${gdN(c.age_seconds)} 秒 / ${gdN(c.rounds)} 轮，
       距下次允许重建还有 ${gdN(c.seconds_left)} 秒 / ${gdN(c.rounds_left)} 轮；
-      ${c.pending_change ? '<b>检测到新内容待换入（节流中，暂不换块）</b>' : '与即时候选字节一致'}。
+      ${c.topic_active ? `<b>本轮含话题增量（补入 #${(c.topic_ids || []).join(' #')}）</b>，与纯底档字节不同属正常`
+        : (c.pending_change ? '<b>检测到新内容待换入（节流中，暂不换块）</b>' : '与即时候选字节一致')}。
       ${c.identity_mismatch ? '（面板身份键与运行时缓存的身份键不同，已按缓存里的身份重算指纹）' : ''}`;
   } else {
     state = '<b>真实注入</b>：' + esc(c.hint || '还没有生成过常驻包，发一句话即可，不是故障。');
