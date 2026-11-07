@@ -39,7 +39,9 @@ def _literal(name):
 CFG_DEFAULTS = _literal("CFG_DEFAULTS")
 PROMPT_CFG_KEYS = _literal("PROMPT_CFG_KEYS")
 CACHE_MAX = _literal("INJECT_CACHE_MAX")
-TOPIC_MIN_INTERVAL = _literal("TOPIC_MIN_INTERVAL")
+# 0.16.15 起「话题防抖窗口」已移除（fp 变了就重建）。常量保留为 0，
+# 只当「把 built_at 往前推」的测试辅助，不再参与任何判定。
+TOPIC_MIN_INTERVAL = 0.0
 
 NS = {
     "hashlib": hashlib, "time": time,
@@ -98,17 +100,19 @@ def _fixture(path, noise=120):
     rows = []
     for i in range(noise):
         rows.append(("闲聊碎片", f"第{i}次随口提到天气和晚饭，还有通勤", 0.99))
-    rows.append(("饮品偏好", "喜欢喝拿铁", 0.35))
+    rows.append(("饮品偏好", "喜欢喝拿铁", 0.35, "那个拿铁其实有点东西；我一般都点这个"))
     rows.append(("饮品偏好", "喜欢喝拿铁不加糖", 0.34))
     rows.append(("饮品偏好", "常点拿铁", 0.33))
     rows.append(("户外", "周末常去登山", 0.32))
     rows.append(("户外", "登山鞋是去年买的", 0.31))
-    for i, (pred, val, conf) in enumerate(rows):
+    for i, row in enumerate(rows):
+        pred, val, conf = row[0], row[1], row[2]
+        alias = row[3] if len(row) > 3 else ""
         con.execute(
-            "INSERT INTO l2_facts (layer,subject,predicate,value,speaker,source_type,"
-            "fingerprint,confidence,status,stability,created_at,updated_at,stored_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("L2", "测试人", pred, val, "测试人", "chat", f"fp{i}",
+            "INSERT INTO l2_facts (layer,subject,predicate,value,ask_alias,speaker,"
+            "source_type,fingerprint,confidence,status,stability,created_at,updated_at,stored_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("L2", "测试人", pred, val, alias, "测试人", "chat", f"fp{i}",
              conf, "active", 0, ts + i, ts + i, ts + i))
     con.commit()
     return store
@@ -158,11 +162,13 @@ def main():
         print(f"[3] 去冗余 ✓ 6 条候选压到 {len(kept)} 条，近重复让位")
 
         # 4) 上下文补位：「那它呢」本轮零命中，靠上一轮把拿铁带回来
+        # 0.16.16 起 _rel/_rel_content 只统计「本轮本体」命中，历史原话的
+        # 贡献单独记在 _rel_ctx —— 否则上一轮的话题会一直污染下一轮。
         p2 = b.build(query="那它呢", budget_tokens=1200,
                      recent_queries=["上次说喜欢喝拿铁"])
         hit = [r for r in p2["l2"]
                if "拿铁" in str(r.get("value") or "")
-               and int(r.get("_rel_content") or 0) > 0]
+               and int(r.get("_rel_ctx") or 0) > 0]
         assert hit, "最近几轮没参与检索，指代问法依旧零命中"
         assert p2.get("query_context"), "上下文没记录，面板无法解释"
         print("[4] 上下文 ✓ 「那它呢」接上了上一轮的拿铁")
@@ -181,7 +187,7 @@ def main():
             if "拿铁" in r["value"]][:1]
         b3, _, _, m3 = f._frozen_block(
             "测试人", "S1", 1200, topic_ids=ids, topic_query="拿铁")
-        assert m3["reason"] == "topic_hit", \
+        assert m3["reason"] == "fp_changed", \
             f"话题命中没触发增量刷新：reason={m3['reason']}"
         assert "拿铁" in b3, "刷新了但答案没进包"
         b4, _, _, m4 = f._frozen_block(
@@ -213,7 +219,7 @@ def main():
         c2, _, _, cm2 = f2._frozen_block(
             "测试人", "T1", 300, topic_ids=latte_ids,
             topic_query="上次说的拿铁")
-        assert cm2["reason"] == "topic_hit", f"小预算没刷新：{cm2['reason']}"
+        assert cm2["reason"] == "fp_changed", f"小预算没刷新：{cm2['reason']}"
         assert "拿铁" in c2, "小预算下话题增量被 trim 砍光，补了等于没补"
         print("[7] 小预算 ✓ 300 tok 下话题事实仍进包")
 
@@ -245,14 +251,14 @@ def main():
             e["built_at"] -= TOPIC_MIN_INTERVAL + 1
         _, _, _, em2 = f4._frozen_block(
             "测试人", "T3", 1200, topic_ids=latte_ids, topic_query="拿铁")
-        assert em2["reason"] == "topic_hit"
+        assert em2["reason"] == "fp_changed"
         hike_ids = [r["id"] for r in store.query_active_l2(
             subject="测试人", limit=200, query="登山")
             if "登山" in r["value"]][:3]
         # 刻意不推进时间：固定防抖若还在压，这里就会漏掉新话题
         e3, _, _, em3 = f4._frozen_block(
             "测试人", "T3", 1200, topic_ids=hike_ids, topic_query="登山")
-        assert em3["reason"] == "topic_hit", "真换话题被防抖压住了"
+        assert em3["reason"] == "fp_changed", "真换话题被防抖压住了"
         assert "登山" in e3
         print("[10] 换话题 ✓ 补入完全不同的一组事实，立刻刷新")
 
@@ -325,7 +331,7 @@ def main():
             tb, _, _, tm = f5._frozen_block(
                 "测试人", "P1", 1200, topic_ids=stat["topic_ids"],
                 topic_query="做音乐")
-            assert tm["reason"] == "topic_hit", f"端到端没刷新：{tm['reason']}"
+            assert tm["reason"] == "fp_changed", f"端到端没刷新：{tm['reason']}"
             assert "做音乐" in tb, "做音乐没补进冻结包"
             print("[12b] 端到端 ✓ 输入做音乐后冻结包真刷新并补入该事实")
         finally:
@@ -334,6 +340,27 @@ def main():
             except Exception:
                 pass
             shutil.rmtree(tmp2, ignore_errors=True)
+
+        # 13) 噪声闸门（0.16.16）：问法别名里的口语词、上一轮的话题词，
+        #     都不能顶替「本轮本体命中」。实测反例：「嘿嘿想你了」靠 #46 别名
+        #     里的「你了」把「定时任务插件」补进尾部；「吃东西」靠上一轮的
+        #     「插件开发」把「开发了记忆系统插件」补进尾部。
+        #     fixture 里「喜欢喝拿铁」的别名带「其实 / 有点 / 东西」，正好当诱饵。
+        #    断言的是打分口径（_rel 只算本轮本体），不是「l2 里有没有它」——
+        #    l2 还承担「保底 3 条」的职责，拿铁以零命中身份待在里面是正常的，
+        #    真正决定它会不会被补进尾部的是 main 里那条 _rel>0 的候选条件。
+        p13 = b.build(query="东西", budget_tokens=1200, recent_queries=[])
+        for r in p13["l2"]:
+            if "拿铁" in str(r.get("value") or ""):
+                assert int(r.get("_rel") or 0) == 0, \
+                    "问法别名里的口语词被算成了本体命中"
+        p14 = b.build(query="吃东西", budget_tokens=1200,
+                      recent_queries=["喜欢喝拿铁"])
+        for r in p14["l2"]:
+            if "拿铁" in str(r.get("value") or ""):
+                assert int(r.get("_rel") or 0) == 0, \
+                    "上一轮的话题词混进了本轮的命中判据"
+        print("[13] 噪声闸门 ✓ 别名口语词 / 历史话题词都不再冒充本轮命中")
 
         print("\nALL CHECKS PASSED")
     finally:

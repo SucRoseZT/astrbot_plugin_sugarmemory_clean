@@ -412,7 +412,11 @@ CREATE TABLE IF NOT EXISTS token_usage (
   -- 2026-11-06 归因列：重建到底是因为改了配置、L2 改写、节流到点，
   -- 还是「插件重载后内存缓存被清空」。最后一种（cold/reload）字节往往
   -- 一个都没变，provider 缓存理论上还在，整轮 0% 属于固定正常，不该算失败样本。
-  rebuild_reason TEXT NOT NULL DEFAULT ''
+  rebuild_reason TEXT NOT NULL DEFAULT '',
+  -- 2026-11-08：常驻底档（prefix 那 12 条 L2）自己的指纹，与整块 inject_fp 分开记。
+  -- inject_fp 含本轮话题尾部，换个话题就变；用它判「漂移」会把正常的话题刷新
+  -- 全算成故障。真正该盯的是这一列：它一变才说明常驻前缀被改写了。
+  prefix_sig TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tok_ts ON token_usage(ts);
 CREATE INDEX IF NOT EXISTS idx_tok_mod ON token_usage(module, ts);
@@ -900,6 +904,7 @@ class SugarStore:
             ("freeze_rounds", "INTEGER NOT NULL DEFAULT 0"),
             ("cfg_ver", "TEXT NOT NULL DEFAULT ''"),
             ("rebuild_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("prefix_sig", "TEXT NOT NULL DEFAULT ''"),
         ):
             if col not in tok_cols:
                 self._db.execute(f"ALTER TABLE token_usage ADD COLUMN {col} {ddl}")
@@ -3705,7 +3710,7 @@ class SugarStore:
                      session_id: str = "", total: int | None = None,
                      ts: float | None = None, arch_ver: str = "", inject_fp: str = "",
                      rebuilt: int = 0, freeze_rounds: int = 0, cfg_ver: str = "",
-                     rebuild_reason: str = "") -> int:
+                     rebuild_reason: str = "", prefix_sig: str = "") -> int:
         """记一条用量。source=actual 是 provider 报的真实 usage，estimate 是我们估的。
 
         arch_ver/inject_fp/rebuilt/freeze_rounds/cfg_ver/rebuild_reason 只对
@@ -3713,19 +3718,23 @@ class SugarStore:
         前缀、是不是刚重建过、为什么重建。
         注意 cached 是**整轮请求**的前缀缓存（框架 system + 历史 + 工具 schema），
         不等于「记忆块命中率」，只有把同 fp 连续轮与重建轮分开对比才有意义。
+
+        prefix_sig 是常驻底档（prefix 那几条 L2）单独的指纹：inject_fp 含本轮
+        话题尾部，换话题就变；判「冻结有没有生效」必须看 prefix_sig。
         """
         total = int(total if total is not None else (input + cached + output))
         with self._lock, self._db:
             cur = self._db.execute(
                 "INSERT INTO token_usage (ts, module, source, provider_id, subject, session_id,"
                 " input, cached, output, total, arch_ver, inject_fp, rebuilt, freeze_rounds,"
-                " cfg_ver, rebuild_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cfg_ver, rebuild_reason, prefix_sig) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (float(ts or time.time()), str(module or "other")[:32], str(source or "actual")[:16],
                  str(provider_id or "")[:64], str(subject or "")[:40], str(session_id or "")[:120],
                  int(input or 0), int(cached or 0), int(output or 0), max(0, total),
                  str(arch_ver or "")[:16], str(inject_fp or "")[:32],
                  1 if rebuilt else 0, max(0, int(freeze_rounds or 0)),
-                 str(cfg_ver or "")[:32], str(rebuild_reason or "")[:24]),
+                 str(cfg_ver or "")[:32], str(rebuild_reason or "")[:24],
+                 str(prefix_sig or "")[:32]),
             )
             return int(cur.lastrowid)
 

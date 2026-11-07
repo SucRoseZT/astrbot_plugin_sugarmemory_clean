@@ -54,7 +54,9 @@ def _literal(name):
 CFG_DEFAULTS = _literal("CFG_DEFAULTS")
 PROMPT_CFG_KEYS = _literal("PROMPT_CFG_KEYS")
 CACHE_MAX = _literal("INJECT_CACHE_MAX")
-TOPIC_MIN_INTERVAL = _literal("TOPIC_MIN_INTERVAL")
+# 0.16.15 起「话题防抖窗口」已移除（fp 变了就重建）。常量保留为 0，
+# 只当「把 built_at 往前推」的测试辅助，不再参与任何判定。
+TOPIC_MIN_INTERVAL = 0.0
 
 import logging  # noqa: E402
 
@@ -265,7 +267,7 @@ def main():
                 topic_query="你潜水的时候害怕吗",
                 recent_queries=["你潜水的时候害怕吗"])
             print(f"[6] 基线 fp={m0['fp']} → 话题命中 fp={m1['fp']} reason={m1['reason']}")
-            assert m1["reason"] == "topic_hit", "话题刷新没触发"
+            assert m1["reason"] == "fp_changed", "话题刷新没触发"
 
             def _l2(block):
                 return [ln for ln in block.splitlines() if "L2|" in ln]

@@ -276,18 +276,11 @@ CFG_ITEMS = [
      "dynamic＝回到旧版按本轮原话实时检索，每轮都变、前缀缓存基本不命中。"
      "dynamic 只用于 A/B 对照或紧急回退，日常请保持 frozen。"
      "切换这一项会让所有活跃分片各重建一次，属预期行为；用量表里用 arch_ver 区分两批数据"),
-    ("inject_dedup", "冻结常驻记忆包（兼容旧开关）", "bool", "inject",
-     "老开关，只管 frozen 模式下「内容变了要不要真节流」，不再决定用哪套架构"
-     "（架构由上方 inject_mode 决定）。开启后常驻包在冻结时长/轮数内不随流水刷新，"
-     "新写入的长期事实仍立即重建；关掉＝每轮重新生成 query=\"\" 的常驻包，"
-     "仍不是旧的动态包，只用于排查缓存问题。建议保持开启"),
-    ("inject_freeze_seconds", "常驻包最短冻结秒数", "int", "inject",
-     "记忆包内容变了（新转述、新跨会话消息）也先别换：至少隔这么多秒才允许重建，"
-     "否则每轮一句新消息就把整段前缀缓存冲掉。默认 180 秒，与服务商缓存 TTL 对齐。"
-     "填 0 = 只要内容有变化就立刻重建（命中率会掉回去）"),
-    ("inject_freeze_rounds", "常驻包最多连续多少轮不重建", "int", "inject",
-     "即使没到冻结秒数，聊满这么多轮也允许重建一次，避免快速对话里新记忆迟迟不生效。"
-     "默认 12 轮。填 0 = 只看秒数"),
+    ("inject_dedup", "冻结常驻记忆包", "bool", "inject",
+     "冻结的总闸，不是架构开关（架构由上方 inject_mode 决定）。开启后：这一轮算出来的"
+     "块跟上一次挂出去的一模一样，就原样复用，一个字节都不重算；不一样才重建。"
+     "关掉＝每轮无条件重算 query=\"\" 的常驻包，等于放弃冻结，只用于排查缓存问题。"
+     "建议保持开启"),
     ("inject_budget_tokens", "注入预算", "int", "inject",
      "这是上限、不是目标：常驻包实际多大由记忆库和各项配额决定（本机实测最厚约 900 tok）。"
      "调大不会多花一分钱，只是给记忆增长留余量；调到低于实际体积就会触发裁剪，"
@@ -334,10 +327,6 @@ CFG_ITEMS = [
     ("inject_topic_extra", "话题刷新最多补几条", "int", "inject",
      "话题触发那一轮最多补几条包外高相关长期事实。用「替换最弱常驻条」的方式补，"
      "不把包撑大、不额外烧预算。建议 3，0 = 只刷新不补事实"),
-    ("inject_topic_min_interval", "话题抖动防抖间隔（秒）", "int", "inject",
-     "同一话题里换个说法、补进来的还是同几条事实时，至少隔这么久才允许再重建一次，"
-     "防前缀来回抖。补进来的是完全不同的一组事实＝真换话题，不受这个限制，立刻刷新。"
-     "默认 8 秒；设 0 = 只按话题内容判，不再按时间压"),
     ("pack_context_rounds", "最近几轮一起参与检索", "int", "inject",
      "「那它呢」「刚才那个」本轮字面零命中，把最近几轮用户原话按 0.4 权重一起参与"
      "检索就能接上。只给检索用，不进问法判断、不进注入块渲染。建议 3，0 = 关"),
@@ -483,9 +472,6 @@ PROMPT_CFG_KEYS = (
 # 常驻包分片上限。每片存一份约 1KB 的完整块；真库目前 12 个 (人,会话)，
 # 长期运行还会随新会话累积。超了按最久未重建淘汰，别让 dict 无界增长。
 INJECT_CACHE_MAX = 64
-# B 方案话题刷新最小间隔（秒）：连续换话题时不让每轮都重建，省前缀缓存。
-# 真正的记忆改写（l2_sig 变化）不受此限制，照旧立刻重建。
-TOPIC_MIN_INTERVAL = 8.0  # 兜底默认值；实际读 inject_topic_min_interval
 # 距上一轮超过这个秒数，provider 侧的前缀缓存基本已经过期（常见 TTL 5~10 分钟）。
 # 这类轮次 0% 是自然过期，不是插件把前缀弄坏了，统计上要单独剔除。
 CACHE_EXPIRE_GAP = 600
@@ -596,14 +582,12 @@ CFG_DEFAULTS = {
     "inject_cross_include_self": False,
     "inject_mode": "frozen",
     "inject_dedup": True,
-    "inject_freeze_seconds": 180, "inject_freeze_rounds": 12,
     "inject_budget_tokens": 1200, "pack_l3_snippets": 0, "pack_l2_limit": 12,
     "inject_l2_resident_limit": 0,
     "pack_l2_keep_min": 3, "pack_l3_keep_min": 0, "pack_l2_rel_ratio": 30,
     "pack_query_expand": True, "pack_semantic_fallback": False,
     "semantic_provider_id": "", "semantic_timeout_ms": 1500,
     "inject_topic_refresh": True, "inject_topic_extra": 3,
-    "inject_topic_min_interval": 8,
     "pack_context_rounds": 3, "pack_l2_candidate_limit": 200,
     "l3_skeleton_enabled": True, "skeleton_retention_days": 90,
     "inject_skeleton_limit": 2,
@@ -1561,6 +1545,9 @@ class SugarMemory(Star):
                     "freeze_rounds": int(st.get("rounds") or 0),
                     "cfg_ver": str(st.get("cfg_fp") or ""),
                     "rebuild_reason": str(st.get("reason") or ""),
+                    # 常驻底档自己的指纹：面板判「冻结生效没」用它，
+                    # 整块 fp 换个话题就会变，拿它当故障指标会天天报警。
+                    "prefix_sig": str(st.get("prefix_sig") or ""),
                 }
                 # 重载 / 重启后内存缓存被清空，下一轮必然写一次新缓存。
                 # 在日志里明说这是固定正常，别让用户（和以后的我）拿它当故障查。
@@ -2199,11 +2186,11 @@ class SugarMemory(Star):
         最弱的常驻条，包不撑大）；话题指纹不变就一直复用同一份，闲聊轮次
         一个字节都不动。没有信号时绝大多数对话仍然吃满前缀缓存。
 
-        真节流：内容变了也不立刻换。L2 结论变了立即重建（用户刚说完自己的
-        名字转头问，包里不能还是旧的），话题指纹变了且过了 TOPIC_MIN_INTERVAL
-        立即重建，其余流水变化至少冻结 inject_freeze_seconds 秒、或聊满
-        inject_freeze_rounds 轮才重建。话题结束变回闲聊不立刻切回，走节流
-        慢慢退，避免前缀在两种包之间来回抖。
+        重建判据只有一条（0.16.15 起）：这一轮算出来的块，跟上一轮真正挂出去的
+        是不是同一串字节。一样就原样复用（连时间都不判，聊一百轮也不动）；
+        不一样就重建。没有时间 / 轮数节流——B 方案的召回是纯追加在整块最末尾，
+        前缀段（前 prefix_n 条 L2 + 关系快照前段）字节不动，重建只重算尾部几条，
+        硬等 180 秒对缓存没有收益，只会让新记忆迟到。
         关系快照和记忆包合成同一个块一起冻结——它单独变也会废掉整段前缀。
         """
         bot = self._iso(bot_id)
@@ -2220,13 +2207,10 @@ class SugarMemory(Star):
             except (TypeError, ValueError):
                 return int(default)
 
-        ttl = _int_cfg("inject_freeze_seconds", 180)
-        max_rounds = _int_cfg("inject_freeze_rounds", 12)
         l2_limit = max(1, _int_cfg("pack_l2_limit", 12))
         # 常驻前缀实际条数：默认 = l2_limit；配置项收缩后只带前几条身份/习惯，
         # 其余事实退到「聊到再召回」，不再每轮都占着 system 的固定位置。
         resident_n = self._resident_l2_n()
-
         # 常驻包不能沿用 pack_l2_keep_min（默认 3）：query="" 时
         # _filter_by_relevance 走零命中的保底分支，会把档案砍到 3 条。
         # 把保底抬到 l2_limit，让它按置信度/稳度带满常驻条目。
@@ -2305,9 +2289,20 @@ class SugarMemory(Star):
                      if int(r.get("id") or 0) not in keep_ids
                      and (r.get("_sem")
                           or int(r.get("_rel_content") or 0) > 0
-                          or int(r.get("_rel") or 0) > 0)]
+                          or int(r.get("_rel") or 0) > 0
+                          # 指代（「那它呢」）和问法别名召回的行 _rel 恒为 0，
+                          # 只认 _rel 会把它们挡在尾部之外 —— 那正是这两个通道
+                          # 存在的意义（实测「那它呢」整句零 _rel，答案在 _rel_ctx）。
+                          or int(r.get("_rel_ctx") or 0) > 0
+                          or int(r.get("_rel_alias") or 0) >= 2)]
             cands.sort(key=lambda r: (float(r.get("_rel_w") or 0),
                                       float(r.get("_score") or 0)), reverse=True)
+            # 同一件事被总结成好几条时（#9「开发了记忆插件」/#45「开发了记忆
+            # 系统插件」/#73「开发并修复了多个插件」），尾部只有 3 个名额，
+            # 全是近重复等于白补。复用主包那套重叠系数去重，阈值放软到 0.6
+            # ——尾部本来就是给「换个说法」用的，主包那档 0.7 太严。
+            if len(cands) > 1:
+                cands = tb._apply_mmr(cands, lam=0.6)
             ceiling = max((float(x.get("_score") or 0) for x in prefix), default=1.0)
             recalled = []
             # 只为凑满 tail_k 抓低分噪声的坑（2026-11-08）：实盘「xulaoya 和我的
@@ -2332,12 +2327,21 @@ class SugarMemory(Star):
                 recalled.append(r)
                 add_ids.append(int(r.get("id") or 0))
             if not recalled and prev_ent:
-                # 本轮一条都没捞到：沿用上一轮的尾巴，块保持原样 → fp 不变 →
-                # 直接命上轮缓存。绝不能缩回纯底档，那等于把付过代价的尾部扔掉。
-                recalled = [dict(r) for r in (prev_ent.get("tail_rows") or [])]
-                for r in recalled:
-                    r["_topic_add"] = True
-                add_ids = [int(r.get("id") or 0) for r in recalled]
+                # 本轮没捞到新东西，但旧尾巴要不要留，得看是不是还在这条话题上。
+                # 判据：这一轮有没有任何内容命中（_rel>0 只算本轮本体，不算
+                # 历史词和问法别名）。
+                #   零命中 = 这句是应答/寒暄/情感表达（「嘿嘿想你了」「啊？我
+                #   有点没懂」），接着上一条说是对的 → 沿用，块字节不变还能
+                #   直接命上轮缓存。
+                #   有命中却跟旧尾巴无关（上轮聊「插件开发」，这轮「吃东西」）
+                #   = 真换话题 → 清掉。尾部追加在块末，清掉不伤前缀缓存，
+                #   挂着反而让 AI 以为用户这轮还在说插件。
+                pool_now = topic_pack.get("_l2_pool") or []
+                if not any(int(r.get("_rel") or 0) > 0 for r in pool_now):
+                    recalled = [dict(r) for r in (prev_ent.get("tail_rows") or [])]
+                    for r in recalled:
+                        r["_topic_add"] = True
+                    add_ids = [int(r.get("id") or 0) for r in recalled]
             # 纯追加：prefix（原样）+ 底档尾部（原样，含永久）+ 本轮召回。
             # 前缀零改动 → 前缀缓存命中；永久事实一条不丢；块最多长 tail_k 条，
             # 超预算时由 trim_pack 砍最弱的非保护条（永久/话题条都已打 pin）。
@@ -2373,14 +2377,17 @@ class SugarMemory(Star):
         rel_tok = estimate_tokens(rel_text)
 
         def _meta(used_fp: str, rebuilt: bool, rounds: int, reason: str,
-                  unchanged: bool = False) -> dict:
+                  unchanged: bool = False, prefix: str | None = None) -> dict:
             # fp 必须是**实际挂进 system 的那块**的指纹。节流期复用旧块时
             # 记新候选的 fp 会把「同 fp 连续轮」错算成重建轮，归因就废了。
             # unchanged：重建了内存块，但字节和上一轮完全一样（重载冷启动），
             # 记忆包并没漂移，别把它算成失败样本。
+            # prefix：常驻底档自己的指纹（l2_sig）。整块 fp 含本轮话题尾部，
+            # 换话题必变；面板判「冻结失效」要看这一项，而不是整块 fp。
             return {"fp": used_fp, "rebuilt": bool(rebuilt), "rounds": int(rounds),
                     "reason": reason, "cfg_fp": cfg_fp, "unchanged": bool(unchanged),
                     "topic_sig": topic_sig,
+                    "prefix_sig": str(prefix if prefix is not None else l2_sig),
                     "mode": "frozen", "arch_ver": "frozen"}
 
         ent = self._inject_cache.get(key)
@@ -2400,64 +2407,56 @@ class SugarMemory(Star):
             ent["rounds"] = int(ent.get("rounds", 0)) + 1
             used_rounds = ent["rounds"]
             if fp == ent["fp"]:
-                # 一字未变：连节流条件都不用判，直接复用（前缀必然命中）。
-                # 别在这里刷新 built_at，否则安静的闲聊会永远卡在 TTL 内。
+                # 一字未变：直接复用，连时间都不用看（聊一百轮也不动）。
+                # 不刷新 built_at：它记的是「这块第一次挂出去的时刻」，面板靠它
+                # 显示真实年龄；每轮刷新会让「已冻结多久」永远显示 0。
                 ent["topic_sig"] = topic_sig
                 ent["topic_ids"] = list(add_ids)
                 return (ent["block"], ent["pack_tokens"], ent["rel_tokens"],
-                        _meta(str(ent["fp"]), False, used_rounds, "same_fp"))
-            # 走到这里说明 fp 已变（上面 same_fp 已提前 return）：内容变了就
-            # 重建。prefix 段（前 prefix_n 条）字节不变 → 前缀缓存命中；只有
-            # tail 段随 query 刷新。闲聊时 tail 退化回底档、fp 与上轮一致 →
-            # 走上面的 same_fp 直接复用，零重建。
-            important = l2_sig != ent.get("l2_sig")
-            aged = ttl <= 0 or (now - float(ent.get("built_at", 0))) >= ttl
-            many = max_rounds > 0 and ent["rounds"] >= max_rounds
-            rebuild = True
-            reason = ("l2_changed" if important else
-                      "aged" if aged else
-                      "rounds" if many else "topic_hit")
+                        _meta(str(ent["fp"]), False, used_rounds, "same_fp",
+                              prefix=ent.get("l2_sig")))
+            # fp 变了 = 内容确实变了 → 重建。0.16.15 起这里不再判时间/轮数：
+            # B 方案的召回是纯追加在整块最末尾，prefix 段（前 prefix_n 条 L2 +
+            # 关系快照前段）一个字节都不动，重建只重算尾部几条，硬等 180 秒
+            # 对缓存没有收益，只会让新记下的东西迟到。「L2 底档本身变了」单独
+            # 归因（l2_changed），其余统称 fp_changed。
+            reason = ("l2_changed" if l2_sig != ent.get("l2_sig") else "fp_changed")
 
-        if rebuild:
-            unchanged = False
-            if reason == "cold":
-                # 冻结块只在内存里：插件重载 / 进程重启会把它清空，于是下一轮
-                # 走 cold 重建。但重建出来的字节常常和上一轮一模一样 ——
-                # provider 侧的前缀并没变，只是我们重新算了一遍。
-                # 从库里取上一轮真实挂过的 fp 比对，把这种「假重建」标出来：
-                # 它必然要重新写一次缓存，0% 是固定正常，不是记忆包漂移。
-                try:
-                    prev_fp = self.store.token_last_inject_fp(sess)
-                except Exception:
-                    prev_fp = ""
-                if prev_fp and prev_fp == fp:
-                    reason = "reload"
-                    unchanged = True
-                    logger.info(
-                        "[SugarMemory] 重载冷启动：常驻包字节未变（fp=%s），"
-                        "本轮整轮缓存命中率 0%% 属固定正常，不计入失败样本", fp)
-            # 容量上限：按最久未重建淘汰，别让 (人,会话) 分片无界增长。
-            if (key not in self._inject_cache
-                    and len(self._inject_cache) >= INJECT_CACHE_MAX):
-                victim = min(self._inject_cache,
-                             key=lambda k: float(
-                                 self._inject_cache[k].get("built_at", 0)))
-                self._inject_cache.pop(victim, None)
-            if not preview:
-                self._inject_cache[key] = {
-                    "block": candidate, "fp": fp, "l2_sig": l2_sig,
-                    "topic_sig": topic_sig, "topic_ids": list(add_ids),
-                    "tail_rows": [dict(r) for r in recalled],
-                    "built_at": now, "rounds": 0, "cfg_fp": cfg_fp,
-                    "pack_tokens": pack_tok, "rel_tokens": rel_tok,
-                }
-            logger.debug(
-                f"[SugarMemory] 常驻包重建（{reason}）：{key} ~{pack_tok + rel_tok} tokens")
-            return candidate, pack_tok, rel_tok, _meta(fp, True, 0, reason, unchanged)
-        # 节流期内：内容确实变了，但继续用上一轮的块，换整段前缀缓存。
-        # 新记忆最迟 inject_freeze_seconds 秒 / inject_freeze_rounds 轮后进包。
-        return (ent["block"], ent["pack_tokens"], ent["rel_tokens"],
-                _meta(str(ent.get("fp") or fp), False, used_rounds, "throttled"))
+        unchanged = False
+        if reason == "cold":
+            # 冻结块只在内存里：插件重载 / 进程重启会把它清空，于是下一轮
+            # 走 cold 重建。但重建出来的字节常常和上一轮一模一样 ——
+            # provider 侧的前缀并没变，只是我们重新算了一遍。
+            # 从库里取上一轮真实挂过的 fp 比对，把这种「假重建」标出来：
+            # 它必然要重新写一次缓存，0% 是固定正常，不是记忆包漂移。
+            try:
+                prev_fp = self.store.token_last_inject_fp(sess)
+            except Exception:
+                prev_fp = ""
+            if prev_fp and prev_fp == fp:
+                reason = "reload"
+                unchanged = True
+                logger.info(
+                    "[SugarMemory] 重载冷启动：常驻包字节未变（fp=%s），"
+                    "本轮整轮缓存命中率 0%% 属固定正常，不计入失败样本", fp)
+        # 容量上限：按最久未重建淘汰，别让 (人,会话) 分片无界增长。
+        if (key not in self._inject_cache
+                and len(self._inject_cache) >= INJECT_CACHE_MAX):
+            victim = min(self._inject_cache,
+                         key=lambda k: float(
+                             self._inject_cache[k].get("built_at", 0)))
+            self._inject_cache.pop(victim, None)
+        if not preview:
+            self._inject_cache[key] = {
+                "block": candidate, "fp": fp, "l2_sig": l2_sig,
+                "topic_sig": topic_sig, "topic_ids": list(add_ids),
+                "tail_rows": [dict(r) for r in recalled],
+                "built_at": now, "rounds": 0, "cfg_fp": cfg_fp,
+                "pack_tokens": pack_tok, "rel_tokens": rel_tok,
+            }
+        logger.debug(
+            f"[SugarMemory] 常驻包重建（{reason}）：{key} ~{pack_tok + rel_tok} tokens")
+        return candidate, pack_tok, rel_tok, _meta(fp, True, 0, reason, unchanged)
 
     # ---------- L3 事件记录 ----------
 
@@ -3238,6 +3237,7 @@ class SugarMemory(Star):
                 w = (self._last_why or {}).get(fid) or {}
                 labels = (
                     ("channel", "通道"), ("bigram", "命中"), ("idf", "IDF"),
+                    ("rel_ctx", "历史"), ("rel_alias", "别名"),
                     ("norm", "归一"), ("confidence", "置信"),
                     ("retention", "保留"), ("intent", "意图"),
                     ("bonus", "加权"), ("mmr", "去重"),
@@ -4186,6 +4186,361 @@ class SugarMemory(Star):
                 logger.debug(f"[SugarMemory] 配置兜底读取失败：{e}")
         return raw, source, detail
 
+    # ---------------------- 注入包设置体检 ----------------------
+    def _pack_audit(self) -> list:
+        """逐项体检注入包相关配置：现在这样设会出什么问题、健康长什么样。
+
+        只读 self._cfg()，不改任何配置。判定区间按本机实测定的保守范围
+        （51 条事实的库、常驻包 700~900 tok），不是理论上的「越大越好」。
+        """
+        def _i(key: str, default: int) -> int:
+            try:
+                return int(self._cfg(key, default))
+            except (TypeError, ValueError):
+                return int(default)
+
+        def _b(key: str, default: bool) -> bool:
+            return bool(self._cfg(key, default))
+
+        def _s(key: str, default: str) -> str:
+            value = self._cfg(key, default)
+            return str(value if value is not None else default).strip()
+
+        rows: list = []
+
+        def add(key, label, value, level, risk, healthy):
+            rows.append({"key": key, "label": label, "value": value,
+                         "level": level, "risk": risk, "healthy": healthy})
+
+        # ---- 1 总开关 ----
+        if not _b("inject_enabled", True):
+            add("inject_enabled", "记忆包注入总开关", "关闭（影子模式）", "warn",
+                "注入 0 字节：记忆照样在攒，但一句都不进 system。面板上五十多条，"
+                "对话里一条都用不上，表现是「它怎么什么都不记得」。",
+                "开启。只有排查「是不是记忆干扰了回复」时才临时关。")
+        else:
+            add("inject_enabled", "记忆包注入总开关", "开启", "good",
+                "没有副作用，这就是正常工作状态。", "开启。")
+
+        mode = _s("inject_mode", "frozen") or "frozen"
+        if mode != "frozen":
+            add("inject_mode", "记忆包注入架构", mode, "bad",
+                "dynamic 是旧版按原话实时检索：问法换个字、少打两个字，块就变，"
+                "messages[0] 的第一个字节每轮都不同，前缀缓存基本不命中。",
+                "frozen。切换会让所有活跃分片各重建一次，属预期。")
+        else:
+            add("inject_mode", "记忆包注入架构", "frozen", "good",
+                "按（人, 会话）冻结常驻包，闲聊轮次一个字节都不动。", "frozen。")
+
+        if not _b("inject_dedup", True):
+            add("inject_dedup", "冻结常驻记忆包", "关闭", "bad",
+                "冻结的总闸被关：每轮无条件重算常驻包，内容一模一样也算新块。"
+                "症状很固定——轮次恒 0、重建原因写着 dedup_off、命中率整片 0%。",
+                "开启。这是「冻结」唯一的总闸，没有第二个开关。")
+        else:
+            add("inject_dedup", "冻结常驻记忆包", "开启", "good",
+                "内容不变就原样复用，不重算、不重发。", "开启。")
+
+        # ---- 2 预算与条数 ----
+        budget = _i("inject_budget_tokens", 1200)
+        if budget < 300:
+            add("inject_budget_tokens", "注入预算", f"{budget} tok", "bad",
+                "预算比身份底档还小：超预算会「突破保底」继续砍，长期事实可能只剩 1 条，"
+                "问什么都缺记忆。",
+                "600~1600，且比面板上的实测体积多留 20~30%。")
+        elif budget < 600:
+            add("inject_budget_tokens", "注入预算", f"{budget} tok", "warn",
+                "余量太薄：库一长（事实变多、转述进来）就开始触发裁剪，"
+                "症状是「有时记得、有时不记得」，还查不出原因。",
+                "600~1600，且比面板上的实测体积多留 20~30%。")
+        elif budget <= 2400:
+            add("inject_budget_tokens", "注入预算", f"{budget} tok", "good",
+                "预算是天花板不是目标：实际多大由记忆库决定，调大不会多花一分钱。",
+                "600~1600 起步，调大条数配额时同步提到 1400~1600。")
+        else:
+            add("inject_budget_tokens", "注入预算", f"{budget} tok", "warn",
+                "远高于常见体积：不会更聪明，只会让块更容易变厚、更占上下文窗口；"
+                "真正决定召回的是下面几项配额，不是这个数。",
+                "600~1600。留余量靠实测体积 + 20%，不是靠猜一个大数。")
+
+        l2_limit = max(1, _i("pack_l2_limit", 12))
+        if l2_limit < 4:
+            add("pack_l2_limit", "长期事实上限", f"{l2_limit} 条", "bad",
+                "常驻底档太薄：连「这个人是谁、住哪、干什么」都放不下，"
+                "每轮都得靠临时检索补，闲聊时几乎等于没有长期记忆。",
+                "8~16 条（默认 12）。")
+        elif l2_limit < 8:
+            add("pack_l2_limit", "长期事实上限", f"{l2_limit} 条", "warn",
+                "偏薄：身份、习惯、长期状态挤在几条里，预算一紧先掉的就是它们。",
+                "8~16 条（默认 12）。")
+        elif l2_limit <= 24:
+            add("pack_l2_limit", "长期事实上限", f"{l2_limit} 条", "good",
+                "12~16 是实测最稳的一段：够装基本盘，又不会把低相关事实顶进常驻前缀。",
+                "8~16 条（默认 12）。")
+        else:
+            add("pack_l2_limit", "长期事实上限", f"{l2_limit} 条", "warn",
+                "条数太多：低相关事实会挤进常驻前缀，白占 token 还稀释注意力。",
+                "8~16 条（默认 12）。")
+
+        keep = _i("pack_l2_keep_min", 3)
+        if keep < 1:
+            add("pack_l2_keep_min", "长期事实保底条数", f"{keep} 条", "bad",
+                "超预算时一条事实都不保，长期事实段可能整段消失。",
+                "3~5 条，且不大于长期事实上限。")
+        elif keep > l2_limit:
+            add("pack_l2_keep_min", "长期事实保底条数",
+                f"{keep} 条（上限只有 {l2_limit}）", "warn",
+                "保底比上限还大：先按上限取材，再谈保底，所以这一项实际不生效。",
+                "3~5 条，且不大于长期事实上限。")
+        elif keep < 3:
+            add("pack_l2_keep_min", "长期事实保底条数", f"{keep} 条", "warn",
+                "只保 1~2 条：预算一紧就只剩名字，问什么都是「你是……」开头。",
+                "3~5 条，且不大于长期事实上限。")
+        elif keep <= 8:
+            add("pack_l2_keep_min", "长期事实保底条数", f"{keep} 条", "good",
+                "再挤也保住「这个人是谁」的基本盘。",
+                "3~5 条，且不大于长期事实上限。")
+        else:
+            add("pack_l2_keep_min", "长期事实保底条数", f"{keep} 条", "warn",
+                "保底太高：预算紧时保底反而压过别的段，聊天原文和摘要先被挤空。",
+                "3~5 条，且不大于长期事实上限。")
+
+        ratio = _i("pack_l2_rel_ratio", 30)
+        if ratio <= 0:
+            add("pack_l2_rel_ratio", "相关性门槛", "0（关闭过滤）", "warn",
+                "等于关掉相关性过滤：一句「在吗」也能把十几条无关事实拽进包，"
+                "AI 会在打招呼里强行背资料卡。",
+                "20~40（默认 30）。")
+        elif ratio < 15:
+            add("pack_l2_rel_ratio", "相关性门槛", f"{ratio}%", "warn",
+                "门槛太松：命中数不到头名一成多的都留着，闲聊轮次会垫进一堆不相关记忆。",
+                "20~40（默认 30）。")
+        elif ratio <= 45:
+            add("pack_l2_rel_ratio", "相关性门槛", f"{ratio}%", "good",
+                "只留命中数达到头名这个比例的事实，噪声和召回兼顾。",
+                "20~40（默认 30）。")
+        elif ratio <= 70:
+            add("pack_l2_rel_ratio", "相关性门槛", f"{ratio}%", "warn",
+                "偏严：冷门问题容易只剩保底那几条，看着有记忆却答不上细节。",
+                "20~40（默认 30）。")
+        else:
+            add("pack_l2_rel_ratio", "相关性门槛", f"{ratio}%", "bad",
+                "过滤过狠：多数轮次只剩保底条数，等于关掉了按话题召回，"
+                "只剩那几条身份卡反复出现。",
+                "20~40（默认 30）。")
+
+        # ---- 3 召回通道 ----
+        if not _b("pack_query_expand", True):
+            add("pack_query_expand", "问法归一（改写补召回）", "关闭", "warn",
+                "「多大了」「搞什么创作」这类改写问法字面撞不上任何一条，"
+                "召回直接掉一半以上（实测改写问法 90%+ → 20%）。",
+                "开启。关掉等于只认原话里的字。")
+        else:
+            add("pack_query_expand", "问法归一（改写补召回）", "开启", "good",
+                "口语问法先映射成概念词再检索，补住字面匹配的盲区。", "开启。")
+
+        rounds = _i("pack_context_rounds", 3)
+        if rounds <= 0:
+            add("pack_context_rounds", "最近几轮参与检索", "0（关闭）", "warn",
+                "「那它呢 / 后来呢」接不上上一轮：本轮字面零命中，包要么空、要么只剩保底，"
+                "追问等于重新开始。",
+                "2~4 轮（默认 3）。")
+        elif rounds <= 6:
+            add("pack_context_rounds", "最近几轮参与检索", f"{rounds} 轮", "good",
+                "指代追问能接上，又不会把上一个话题拖太远。", "2~4 轮（默认 3）。")
+        else:
+            add("pack_context_rounds", "最近几轮参与检索", f"{rounds} 轮", "warn",
+                "轮数太多：上一话题的记忆会被继续拽进新话题，"
+                "表现是「都聊别的了还挂着前面的事」。",
+                "2~4 轮（默认 3）。")
+
+        cand = _i("pack_l2_candidate_limit", 200)
+        if cand < 50:
+            add("pack_l2_candidate_limit", "长期事实候选池", f"{cand} 条", "warn",
+                "候选池太小：低置信但本轮正好相关的事实进不了候选，漏召回会重新出现。",
+                "150~300（默认 200）。")
+        elif cand <= 400:
+            add("pack_l2_candidate_limit", "长期事实候选池", f"{cand} 条", "good",
+                "先把够多候选捞出来，再按本轮相关度挑，低置信但相关的才有机会被想起。",
+                "150~300（默认 200）。")
+        else:
+            add("pack_l2_candidate_limit", "长期事实候选池", f"{cand} 条", "warn",
+                "候选太多：每轮都要打分，200 条约 10ms 级，再往上收益不明显、CPU 白烧。",
+                "150~300（默认 200）。")
+
+        refresh = _b("inject_topic_refresh", True)
+        if not refresh:
+            add("inject_topic_refresh", "话题命中时刷新常驻包", "关闭", "warn",
+                "纯冻结：常驻包外的答案（某段经历、某条包外事实）永远进不来，"
+                "只能靠常驻那几条答，问「我以前干过什么」就答不全。",
+                "开启。闲聊轮次它不会动包，只在真聊到包外记忆时才重建。")
+        else:
+            add("inject_topic_refresh", "话题命中时刷新常驻包", "开启", "good",
+                "平时一个字节都不动，真聊到包外记忆才补一次，命中率和召回都不亏。",
+                "开启。")
+
+        extra = _i("inject_topic_extra", 3)
+        if not refresh and extra > 0:
+            add("inject_topic_extra", "话题刷新最多补几条", f"{extra} 条", "info",
+                "上面的刷新总闸关着，这一项不生效。", "跟随话题刷新开关。")
+        elif extra == 0:
+            add("inject_topic_extra", "话题刷新最多补几条", "0 条", "warn",
+                "话题触发时只刷新、不补事实——包重建了一次，答案还是没进来，等于白重建。",
+                "3~5 条（默认 3）。")
+        elif extra <= 6:
+            add("inject_topic_extra", "话题刷新最多补几条", f"{extra} 条", "good",
+                "用「替换最弱常驻条」的方式补，不撑大包、不额外烧预算。",
+                "3~5 条（默认 3）。")
+        else:
+            add("inject_topic_extra", "话题刷新最多补几条", f"{extra} 条", "warn",
+                "补太多：替换最弱常驻条时动的前缀更多，这一次重建的代价变大。",
+                "3~5 条（默认 3）。")
+
+        # ---- 4 其余段 ----
+        l3s = _i("pack_l3_snippets", 0)
+        l3k = _i("pack_l3_keep_min", 0)
+        if l3s == 0:
+            add("pack_l3_snippets", "附带聊天原文", "0 条", "good",
+                "框架上下文里本来就有最近几条原文，再带一遍是二次花 token。",
+                "0；只有在需要「原话怎么说的」时才加。")
+        else:
+            add("pack_l3_snippets", "附带聊天原文", f"{l3s} 条", "info",
+                "带原文会和框架已有的历史重复，只在追问原话时才值这几百 token。",
+                "0；需要时 1~2 条。")
+        if l3k > l3s:
+            add("pack_l3_keep_min", "聊天原文保底条数",
+                f"{l3k} 条（上限只有 {l3s}）", "warn",
+                "保底比上限还大：实际按上限取，这一项不生效。",
+                "不大于「附带聊天原文」的条数。")
+        else:
+            add("pack_l3_keep_min", "聊天原文保底条数", f"{l3k} 条", "good",
+                "超预算时按这个数给原文留底，砍到 0 就是允许整段消失。",
+                "0~1，且不大于「附带聊天原文」。")
+
+        skel = _i("inject_skeleton_limit", 2)
+        if skel == 0:
+            add("inject_skeleton_limit", "带几条旧事骨架", "0 条", "info",
+                "骨架不进包：问「咱们以前聊过啥」没有索引可查，只能凭常驻事实。",
+                "1~3 条（一行约 30 token）。")
+        else:
+            add("inject_skeleton_limit", "带几条旧事骨架", f"{skel} 条", "good",
+                "一行约 30 token 换一个话题索引，问「以前聊过啥」时至少有的指。",
+                "1~3 条。")
+
+        cross = _i("inject_cross_limit", 5)
+        if cross == 0:
+            add("inject_cross_limit", "带几条其他会话的近况", "0 条", "info",
+                "只认本会话：别处发生的事不会串进来，保守但安全。",
+                "0~5 条（默认 5）。")
+        elif cross <= 8:
+            add("inject_cross_limit", "带几条其他会话的近况", f"{cross} 条", "good",
+                "按本轮话题筛过才给，还会标出是谁说的，不会乱串。",
+                "0~5 条（默认 5）。")
+        else:
+            add("inject_cross_limit", "带几条其他会话的近况", f"{cross} 条", "warn",
+                "跨会话带太多：别处的事会串台，AI 容易把别人说的按到当前人头上。",
+                "0~5 条（默认 5）。")
+
+        relay = _i("inject_outbound_relay_limit", 3)
+        if relay <= 0:
+            add("inject_outbound_relay_limit", "带几条转述过的话", "0 条", "warn",
+                "转述段整段不进包：问「你刚才替我带了什么话」时 AI 只能凭记忆，"
+                "而它没有这段记忆——容易把真发过的话当幻觉否认。",
+                "2~4 条（默认 3）。")
+        elif relay <= 6:
+            add("inject_outbound_relay_limit", "带几条转述过的话", f"{relay} 条", "good",
+                "发到当前会话的转述排在最前，被追问时有据可查。", "2~4 条（默认 3）。")
+        else:
+            add("inject_outbound_relay_limit", "带几条转述过的话", f"{relay} 条", "warn",
+                "带太多：转述段会挤占事实和摘要的预算，而真正常被追问的只有最近那两三条。",
+                "2~4 条（默认 3）。")
+
+        cron = _i("inject_outbound_cron_limit", 2)
+        if cron <= 0:
+            add("inject_outbound_cron_limit", "带几条定时消息", "0 条", "warn",
+                "定时任务不进包：问「你提醒过我什么」时答不上，也容易否认自己发过提醒。",
+                "1~3 条（默认 2）。")
+        elif cron <= 4:
+            add("inject_outbound_cron_limit", "带几条定时消息", f"{cron} 条", "good",
+                "只带当前会话最近的定时消息，和转述分开计数，不会被说成「替你带的话」。",
+                "1~3 条（默认 2）。")
+        else:
+            add("inject_outbound_cron_limit", "带几条定时消息", f"{cron} 条", "warn",
+                "带太多：闹钟/提醒会淹没真正该答的事实，还占预算。", "1~3 条（默认 2）。")
+
+        if not _b("inject_scope_subject", True):
+            add("inject_scope_subject", "记忆包按人过滤", "关闭", "bad",
+                "全库检索：别人说过的事会按到当前说话人头上（问「我有什么病」"
+                "答出别人的病）。多人共用一个机器人时基本必错。",
+                "开启。")
+        else:
+            add("inject_scope_subject", "记忆包按人过滤", "开启", "good",
+                "只注入当前说话人的事实和本会话摘要，别人说的不会按到他头上。",
+                "开启。")
+
+        sem_on = _b("pack_semantic_fallback", False)
+        sem_pid = _s("semantic_provider_id", "")
+        if sem_on and not sem_pid:
+            add("pack_semantic_fallback", "语义兜底",
+                "开着 · Provider 没填", "warn",
+                "开关开着但没接线：整条语义路静默跳过——零调用、零开销，也零效果。"
+                "以为自己开了语义兜底，其实一直靠字面在跑。",
+                "要开就两个都填：开关 + 支持 embedding 的 Provider ID。")
+        elif sem_on and sem_pid:
+            add("pack_semantic_fallback", "语义兜底", f"开着 · {sem_pid}", "good",
+                "字面/概念/别名三层全零命中时才调一次向量接口，超时或报错自动退回。",
+                "开关 + Provider 都填，超时 1500ms 足够。")
+        elif sem_pid and not sem_on:
+            add("pack_semantic_fallback", "语义兜底",
+                f"关着 · Provider 已填", "info",
+                "填了 Provider 但开关关着，一次都不会调用，一分钱不花。",
+                "不用就两个都空着；要用就两个都填。")
+        else:
+            add("pack_semantic_fallback", "语义兜底", "未启用", "info",
+                "改写问法靠「问法归一」兜；语义类比（打字很响的设备 → 机械键盘）"
+                "这种完全不同字的，兜不住。",
+                "零依赖用法可以一直关着。")
+
+        resident = _i("inject_l2_resident_limit", 0)
+        if resident == 0:
+            add("inject_l2_resident_limit", "常驻事实条数",
+                f"0（等于上限 {l2_limit} 条）", "info",
+                "全部长期事实都常驻，前缀最长但也最全。",
+                "12 条以内可以保持 0；库大时设 6~8 更省。")
+        elif resident > l2_limit:
+            add("inject_l2_resident_limit", "常驻事实条数",
+                f"{resident} 条（上限只有 {l2_limit}）", "warn",
+                "大于长期事实上限：实际按上限取，这一项不生效。",
+                "6~8 条，且不大于长期事实上限。")
+        elif resident >= l2_limit:
+            add("inject_l2_resident_limit", "常驻事实条数",
+                f"{resident} 条（= 上限）", "info",
+                "等于长期事实上限，也就是全部常驻——这一项没起到收缩作用，"
+                "只是把默认值写明了。",
+                "6~8 条比上限小，才真的把经历类退到按话题召回。")
+        elif resident >= 6:
+            add("inject_l2_resident_limit", "常驻事实条数", f"{resident} 条", "good",
+                "只常驻身份和习惯，经历类退到按话题召回，闲聊时不再白占 token。",
+                "6~8 条，且不大于长期事实上限。")
+        else:
+            add("inject_l2_resident_limit", "常驻事实条数", f"{resident} 条", "warn",
+                "常驻面太窄：包里每轮只剩这几条，稍微问偏一点就得靠临时补，"
+                "而临时补会改前缀。",
+                "6~8 条，或 0（不额外限制）。")
+
+        if _b("inject_relations", False):
+            add("inject_relations", "关系快照进包",
+                f"开启 · 最多 {_i('inject_relation_limit', 6)} 条", "info",
+                "关系快照参与「包变没变」的判定：关系一更新就重建一次，"
+                "前缀不动、只重算尾部。不是错误，只是多一次重建。",
+                "要用就开着；介意多几次重建就关掉。")
+        else:
+            add("inject_relations", "关系快照进包", "关闭", "good",
+                "判定只看常驻底档，重建次数更少；关系仍可在「人际关系」页查。",
+                "要用就开着；介意多几次重建就关掉。")
+
+        return rows
+
     async def _api_guide(self):
         """配置引导：自动体检宿主的上下文压缩策略 + 讲清记忆包上下限 + 预览词典。
 
@@ -4384,15 +4739,21 @@ class SugarMemory(Star):
         def _pbool(key: str, default: bool) -> bool:
             return bool(self._cfg(key, default))
 
+        # 体检失败不能把整页带下去：最坏情况是这一块空着，其余照常显示。
+        try:
+            audit_rows = self._pack_audit()
+        except Exception as e:
+            logger.debug(f"[SugarMemory] 注入包设置体检失败：{e}")
+            audit_rows = []
+
         limits = {
             "budget": _pint("inject_budget_tokens", 1200),
             "mode": self._inject_mode(),
             "enabled": _pbool("inject_enabled", True),
-            "freeze_seconds": _pint("inject_freeze_seconds", 180),
-            "freeze_rounds": _pint("inject_freeze_rounds", 12),
             "dedup": _pbool("inject_dedup", True),
             "l2_limit": max(1, _pint("pack_l2_limit", 12)),
             "l2_keep_min": max(1, _pint("pack_l2_keep_min", 3)),
+            "rel_ratio": max(0, _pint("pack_l2_rel_ratio", 30)),
             "l3_keep_min": max(0, _pint("pack_l3_keep_min", 0)),
             "summary_floor_chars": 60,
             "window": window,
@@ -4417,10 +4778,11 @@ class SugarMemory(Star):
                 "注入 0 字节；没有任何记忆时，块里只剩写死的头尾标签。",
                 "裁剪保底：L3 至少 pack_l3_keep_min 条、L2 至少 pack_l2_keep_min 条、"
                 "摘要压到 60 字就不再压、被点名的人至少留 1 条档案。",
-                "复用下限：frozen 模式下同一份块至少冻结 inject_freeze_seconds 秒 / "
-                "inject_freeze_rounds 轮才允许重建；只有新写入 / 改写 L2、以及本轮真的"
-                "补进了包外相关事实（topic_hit）会提前重建。同一话题换说法不重建，"
-                "真换话题不受 inject_topic_min_interval 防抖限制，其余轮次一律复用同一份前缀。",
+                "复用规则：frozen 模式下这一轮算出来的块，跟上一轮真正挂出去的"
+                "一模一样就原样复用，没有「必须等 N 秒 / N 轮」的限制；只要新写入 / 改写 "
+                "L2、本轮补进了包外相关事实，或任何一段渲染结果变了，下一轮立即重建。"
+                "重建时 prefix 段（前几条 L2）字节不动，所以前缀缓存照旧命中，"
+                "代价只有尾部那几条。",
                 "缓存侧还有 provider 自己的下限：必须支持前缀缓存，且常见 TTL 5~10 分钟、"
                 "按块对齐（例如 64 token）。低于这些条件，块再稳也报不出命中。",
             ],
@@ -4431,6 +4793,8 @@ class SugarMemory(Star):
                 "只影响提及统计；但话题命中 / 指代追问时会触发一次增量刷新，把答案补进这一轮。",
                 "dynamic 模式是旧版按原话实时检索，每轮都变、前缀基本不命中，只用于 A/B 对照或紧急回退。",
             ],
+            # 逐项体检：读的是这台机器的真实配置，不是示例。前端只负责渲染。
+            "audit": audit_rows,
         }
         return self._ok({
             "framework": {
@@ -4545,16 +4909,12 @@ class SugarMemory(Star):
             except (TypeError, ValueError):
                 return int(d)
 
-        ttl = _int_cfg("inject_freeze_seconds", 180)
-        max_rounds = _int_cfg("inject_freeze_rounds", 12)
         cur_mode = self._inject_mode()
         freeze = {"dedup": bool(self._cfg("inject_dedup", True)),
-                  "seconds": ttl, "rounds": max_rounds,
                   "budget": budget, "mode": cur_mode,
                   "cfg_fp": self._cfg_fp(),
                   "topic_refresh": bool(self._cfg("inject_topic_refresh", True)),
                   "topic_extra": _int_cfg("inject_topic_extra", 3),
-                  "topic_min_interval": _int_cfg("inject_topic_min_interval", 8),
                   "inject_enabled": bool(self._cfg("inject_enabled", True))}
         common = {"subject": subject, "session_id": eff_sid,
                   # subject_auto：预览没指定人时自动锁定的（不是用户在面板里选的）。
@@ -4711,21 +5071,22 @@ class SugarMemory(Star):
             cache = {
                 "exists": True, "key": ent_key, "runtime_who": runtime_who,
                 "identity_mismatch": mismatch,
-                "age_seconds": int(age), "ttl_seconds": ttl,
-                "seconds_left": max(0, int(ttl - age)),
-                "rounds": rounds, "max_rounds": max_rounds,
-                "rounds_left": max(0, max_rounds - rounds),
+                # 只报现实：这块从什么时候起挂着、连续复用了多少轮。
+                # 0.16.15 起没有「冻结秒数/轮数」这种倒计时——重建只由内容
+                # 决定，所以不再返回 seconds_left / rounds_left 那类假承诺。
+                "age_seconds": int(age), "rounds": rounds,
                 # 话题增量激活时，runtime_fp 是「纯常驻底档」的指纹，跟真正
                 # 挂着的（底档 + 本轮话题补进来的几条）必然不等。这不是
-                # 「有新内容等节流换上」，别让面板一直谎报 pending_change。
+                # 「有新内容待换入」，别让面板一直谎报 pending_change。
                 "topic_active": bool(ent.get("topic_sig")),
                 "topic_ids": list(ent.get("topic_ids") or []),
+                # 库里有新东西、下一轮就会重建（fp 一变即重建，没有等待期）。
                 "pending_change": bool(ent.get("fp") != runtime_fp)
                                   and not bool(ent.get("topic_sig")),
                 "block_tokens": estimate_tokens(str(ent.get("block") or "")),
             }
         else:
-            cache = {"exists": False, "ttl_seconds": ttl, "max_rounds": max_rounds,
+            cache = {"exists": False,
                      "pending_change": False, "identity_mismatch": False,
                      "hint": ("当前是 dynamic 模式，本来就没有冻结缓存；"
                               "下面显示的是按当前配置即时生成的块。"
@@ -5546,9 +5907,12 @@ class SugarMemory(Star):
             by_state = _group(
                 frozen,
                 lambda r: "重建轮" if int(r.get("rebuilt") or 0) else "同 fp 连续轮")
+            # 按「常驻前缀指纹」分组（老数据退回整块 fp）。用 inject_fp 分组会
+            # 把正常的话题尾部刷新也算成一份新包：同一会话聊三个话题就是三份，
+            # 看起来像「一直在重建」，其实前缀一个字节没动。
             by_fp = _group(
-                [r for r in frozen if r.get("inject_fp")],
-                lambda r: str(r.get("inject_fp") or "")[:12])
+                [r for r in frozen if r.get("prefix_sig") or r.get("inject_fp")],
+                lambda r: str(r.get("prefix_sig") or r.get("inject_fp") or "")[:12])
             by_reason = _group(
                 [r for r in frozen if str(r.get("rebuild_reason") or "")],
                 lambda r: str(r.get("rebuild_reason") or ""))
@@ -5591,24 +5955,42 @@ class SugarMemory(Star):
                 elif cur_fp and reason == "reload":
                     # 上一轮没记 fp（老数据），但本轮已确认是「字节未变的重载」
                     pack_stable = True
+                # 常驻底档指纹单独比：整块 fp 含「本轮话题尾部」，换个话题、
+                # 多召一条就变。拿它判漂移，正常的话题刷新会被全算成故障。
+                cur_prefix = str(r.get("prefix_sig") or "")
+                prev_prefix = str(prev.get("prefix_sig") or "") if prev else ""
+                prefix_stable = None
+                if cur_prefix and prev_prefix:
+                    prefix_stable = (cur_prefix == prev_prefix)
                 meta_by_id[int(r.get("id") or 0)] = {
                     "flag": flag, "flag_label": flag_labels.get(flag, flag),
                     "gap_s": round(gap, 1) if gap is not None else None,
                     "long_gap": bool(long_gap),
                     "pack_stable": pack_stable, "prev_fp": prev_fp,
+                    "prefix_stable": prefix_stable, "prefix_sig": cur_prefix,
                     "rebuild_reason": reason,
                 }
                 prev_by_key[k] = r
 
+            # 有 prefix_sig 的轮次按它判；老数据（加列之前）只能退回整块 fp。
+            def _stable_of(m):
+                return m["prefix_stable"] if m["prefix_stable"] is not None else m["pack_stable"]
+
             comparable = [m for m in meta_by_id.values()
-                          if m["pack_stable"] is not None]
-            stable = sum(1 for m in comparable if m["pack_stable"])
+                          if _stable_of(m) is not None]
+            stable = sum(1 for m in comparable if _stable_of(m))
+            prefix_based = sum(1 for m in meta_by_id.values()
+                               if m["prefix_stable"] is not None)
             pack = {
                 "comparable": len(comparable),
                 "stable": stable,
                 "drift": len(comparable) - stable,
                 "uncomparable": len(meta_by_id) - len(comparable),
                 "rate": round(stable / len(comparable), 4) if comparable else 0.0,
+                # basis=prefix 说明这批数据是按常驻底档判的（准）；pack 表示
+                # 还是老数据/老轮次，只能按整块 fp 判，会被话题尾部带偏。
+                "basis": "prefix" if prefix_based else "pack",
+                "prefix_based": prefix_based,
                 # dynamic 旧版每轮重新拼包，没有「常驻包」这个概念，别拿它算稳定性
                 "applicable": arch != "dynamic",
             }
@@ -5649,6 +6031,8 @@ class SugarMemory(Star):
                     "gap_s": m.get("gap_s"),
                     "long_gap": bool(m.get("long_gap")),
                     "pack_stable": m.get("pack_stable"),
+                    "prefix_stable": m.get("prefix_stable"),
+                    "prefix_sig": str(r.get("prefix_sig") or ""),
                 })
 
             return self._ok({
@@ -5675,21 +6059,19 @@ class SugarMemory(Star):
                     "inject_mode": str(self._cfg("inject_mode", "frozen") or "frozen"),
                     "inject_enabled": bool(self._cfg("inject_enabled", True)),
                     "inject_dedup": bool(self._cfg("inject_dedup", True)),
-                    "inject_freeze_seconds": _int_cfg("inject_freeze_seconds", 180),
-                    "inject_freeze_rounds": _int_cfg("inject_freeze_rounds", 12),
                     "inject_budget_tokens": _int_cfg("inject_budget_tokens", 1200),
                     "pack_l2_limit": _int_cfg("pack_l2_limit", 12),
                     "token_stats_enabled": bool(self._cfg("token_stats_enabled", True)),
                     "cache_expire_gap_seconds": int(expire_gap),
                 },
                 "notes": [
-                    "【两个指标，优先看记忆包命中率】记忆包命中率 = 本轮注入块 fp 与同会话上一轮一致的比例，只衡量插件自己挂进 system 的那块有没有变；frozen 架构下它接近 100% 才说明冻结生效。dynamic 旧版没有常驻包，此项不适用。",
+                    "【两个指标，优先看常驻前缀命中率】它 = 常驻底档（prefix 那几条 L2）的指纹与同会话上一轮一致的比例，只衡量插件自己挂进 system 的那块有没有变；frozen 架构下它接近 100% 才说明冻结生效。整块 fp 还含本轮话题尾部，换个话题就会变，拿它判漂移会把正常的话题刷新全算成故障（2026-11-08 起分开记 prefix_sig）。",
                     "整轮请求命中率 = 缓存输入 / (普通输入 + 缓存输入)，只统计 provider 上报真实用量的对话轮（chat / actual）；注入块、工具结果那些按文本估的行不算，否则会算低。",
                     "cached_tokens 是整轮请求的前缀缓存，包含框架 system_prompt、历史消息、工具 schema。所以整轮命中率低 ≠ 记忆包失效：包字节没变时，miss 出在框架历史裁剪 / 工具集变化 / provider 缓存 TTL 这些外层。",
                     f"【0% 有三种是固定正常】首轮要先写一次缓存；插件重载 / 重启会清空内存里的冻结块（日志会提示「重载冷启动」，字节往往一个没变）；距上轮间隔超过 {int(expire_gap)} 秒时 provider 缓存已自然过期。这三类都单独打标，不算失败样本，「有效命中率」也把它们剔除了。",
                     "cached = 0 还可能是这个 provider 没把命中数上报（部分框架只认 OpenAI 格式的 prompt_tokens_details.cached_tokens）。别把零命中一律当成缓存失效。",
                     "工具循环里一次用户消息会打多次 LLM，插件只记「对话轮」，与主库 provider_stats 的请求级记录不是 1:1，跨表对比前先对齐口径。",
-                    "arch_ver=frozen / dynamic 才能做 A/B；旧数据在加字段时已统一锁成 dynamic，作为改造前的 baseline。「按重建原因」能看出 cold/reload、config、l2_changed、aged 各占多少，比只看 rebuilt=1 准。",
+                    "arch_ver=frozen / dynamic 才能做 A/B；旧数据在加字段时已统一锁成 dynamic，作为改造前的 baseline。「按重建原因」能看出 cold/reload、config、l2_changed、fp_changed 各占多少，比只看 rebuilt=1 准。",
                 ],
             })
         except Exception as e:

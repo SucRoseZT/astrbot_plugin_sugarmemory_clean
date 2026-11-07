@@ -4,6 +4,7 @@
 import math
 import re
 import time
+import unicodedata
 
 from .injector import estimate_tokens, trim_pack
 from .store import PERMANENT_PREDICATES, alias_key, retention_score
@@ -13,8 +14,21 @@ from .store import PERMANENT_PREDICATES, alias_key, retention_score
 _TRIM_WARN: dict = {"sig": "", "at": 0.0}
 
 
+def _norm_text(text) -> str:
+    """检索用的最小归一：兼容字符（全角数字/字母）+ 大小写。
+
+    纯 bigram 匹配是逐字符比较的，比任何全文索引都「笨」在这一处：
+    专业全文索引默认大小写不敏感，天然 `iPhone == iphone`，我们这边不是。
+    实测库侧「iPhone 12」切成 {iP, Ph, ho, ne, e1, 12}，问侧「iphone」切成
+    {ip, ph, ho, ne}，只靠 ho/ne 两个凑巧重叠活着；换成 AI / QQ / B站 这种
+    两三个字符的，直接零命中。
+    NFKC 顺带把全角「ｉＰｈｏｎｅ」「１２３」折成半角，中文汉字不受影响。
+    """
+    return unicodedata.normalize("NFKC", str(text or "")).casefold()
+
+
 def _bigrams(text: str) -> set[str]:
-    text = re.sub(r"\s+", "", str(text or ""))
+    text = re.sub(r"\s+", "", _norm_text(text))
     if len(text) < 2:
         return {text} if text else set()
     return {text[i: i + 2] for i in range(len(text) - 1)}
@@ -30,13 +44,34 @@ _NUM_RE = re.compile(r"[0-9零一二两三四五六七八九十百千万]+")
 
 
 def _l2_text(r: dict) -> str:
-    return (f"{r.get('subject', '')}{r.get('predicate', '')}"
-            f"{r.get('value', '')}{r.get('ask_alias', '')}")
+    """事实本体 + 主体名。**刻意不含 ask_alias，也不含 predicate**。
+
+    ask_alias 是模型写的三句口语化问法，每条覆盖「其实 / 有点 / 东西 /
+    你了」这类日常词汇，整段拼进检索文本等于给每条记忆挂一个万能噪声
+    接收器：一句「嘿嘿想你了」能靠别名里的「你了」撞上「定时任务插件」。
+    0.16.16 起 alias 走独立低权通道，只在本体零命中时兜底。
+
+    predicate 是**分类名**（关系 / 打算 / 经历 / 评价认为），不是内容。
+    拼进来等于给同一类下每条记忆盖同一个章：概念词「关系」一激活，
+    「我有对象吗」就把妈妈、妹妹、猫、最好的朋友五条全捞进来（实测 5 条
+    274 token，只有 1 条是答案）。分类不进入检索文本，让 value 自己说话。
+    """
+    return f"{r.get('subject', '')}{r.get('value', '')}"
 
 
 def _l2_content(r: dict) -> str:
-    return (f"{r.get('predicate', '')}{r.get('value', '')}"
-            f"{r.get('ask_alias', '')}")
+    """事实内容，不含主体名、也不含分类名。
+
+    两个都不该进：主体名用来区分「只提到这个人」和「内容被提到」，分类名
+    （关系 / 打算 / 经历）是给人类看的标签，同一类下每条都带同样的两字，
+    概念词一旦等于分类名（「对象 恋爱 关系」里的「关系」）整类会一起中招。
+    """
+    return str(r.get("value", ""))
+
+
+def _l2_alias(r: dict) -> str:
+    """问法别名：只做兜底召回，不进主相关性判据。"""
+    return str(r.get("ask_alias") or "")
 
 
 # ---- 常驻底档的 predicate 权重 ----
@@ -63,6 +98,88 @@ _RESIDENT_WEIGHT = {
 _RESIDENT_WEIGHT_DEFAULT = 0.8
 
 
+# 泛用 bigram：疑问词、指代词、口头禅。整句只靠这些撞上一条事实时，那不是
+# 「相关」而是巧合。实测：「我养过什么宠物」把「什么也不知道」那条评价记忆
+# 捞进尾部（库里根本没有宠物事实）；「我平时爱吃什么」捞到「平时基本不运动」。
+# 做法是直接从命中集合里扣掉，而不是「有泛用词就整条作废」——「那个插件」
+# 里的「插件」是真信号，只扣「那个」。扣完为空就等于没命中。
+_STOP_GRAMS = frozenset({
+    "什么", "怎么", "为什", "么样", "那个", "这个", "哪个", "哪些", "这些",
+    "那些", "一些", "一下", "一样", "一点", "有点", "有些", "很多", "其实",
+    "但是", "因为", "所以", "然后", "现在", "时候", "感觉", "觉得", "应该",
+    "可以", "真的", "就是", "还是", "或者", "我们", "你们", "他们", "她们",
+    "自己", "别人", "平时", "最近", "以前", "刚才", "上次", "这次", "了吗",
+    "好的", "知道", "不知",
+    # 量词/泛用量：「一个月挣多少钱」靠「一个」撞上「去年一个人去北海道」，
+    # 一条关于旅行的经历压过了工资那条真答案（实测排第 1）。「一个」在任何
+    # 句子里都不指向任何具体话题。
+    "一个", "一种", "一件", "一次",
+    # 泛用指代：「东西 / 事情」在任何句子里都不指具体话题，却因为口语里
+    # 到处出现（「买东西」「吃的东西」）而撞得极准。实测「我丢过什么东西」
+    # 被「喜欢在拼多多买东西」抢了第一（IDF 算下来 5.05，比真答案「赶集的
+    # 时候丢过钱包」高一倍），问丢东西答爱购物。
+    "东西", "事情", "事儿",
+    # 副词 / 连词 / 泛指词。只收能构成 bigram 的双字词——检索是字粒度，
+    # 单字停用词在这里加是自欺欺人（「很」「太」本来就过不了 _FUNC_CHARS
+    # 的两侧过滤）。
+    #
+    # 时间是**话题之外的维度**：「一直」「已经」「突然」修饰任何事，
+    # 却不指向任何一件事，跟「以前」「最近」是同一类，处理方式也该一致。
+    "已经", "正在", "总是", "一直", "从来", "马上", "立刻", "顿时",
+    "忽然", "突然", "渐渐", "逐渐", "慢慢", "刚刚", "快要", "就要",
+    "非常", "特别", "十分", "极其", "相当", "几乎", "稍微", "比较",
+    "而且", "并且", "不过", "可是", "然而", "因此", "如果", "虽然",
+    "尽管", "除非", "只要", "于是", "要么", "不但", "反而",
+    "各种", "任何", "所有", "每个", "某些", "其他", "一样", "之间",
+    "是不是", "有没有", "能不能", "会不会", "要不要", "对不对",
+})
+
+# 功能字：两个都是功能字的 bigram 是跨词边界的碎片（「的那」「你了」「是我」
+# 「在这」），不携带任何主题信息。它们反而因为在整个库里罕见，IDF 给得高得
+# 离谱 —— 实测「上次说的那个事」就是靠 #79 里「用的**的那**个记忆插件」这一
+# 段碎片把一条完全无关的评价记忆顶到尾部第一位。词表治不了这种，只能按字判。
+_FUNC_CHARS = set("的了是在有和就都也还很太更最这那个什么怎谁哪咋嘛么之其而但所因如若虽"
+                  "你我他她它们啊吧呢吗呀哦哈嘿呀啦呀")
+
+
+_ASCII_WORD = re.compile(r"[a-z0-9]{2,}")
+
+
+def _content_grams(text: str) -> set[str]:
+    """带虚字过滤的 bigram + 英文/数字整词。"""
+    t = _norm_text(text)
+    grams = {g for g in _bigrams(t)
+             if not (len(g) == 2 and g[0] in _FUNC_CHARS and g[1] in _FUNC_CHARS)}
+    # 英文和数字另外给一份**整词**。2-gram 拿来做检索有个绕不过去的坑：
+    # Java / JavaScript 共享 {ja, av, va}，问「Java 好用吗」能把 JS 那条
+    # 拉上来；「6800」和「68000」也共享四个 gram。整词的 df 天然低，
+    # IDF 就高，命中一个整词等于「说的是同一个东西」，比五个 2-gram 都硬。
+    # 不删 2-gram：整词挡不住的形态变化（iphone / iphone12）还得靠它。
+    grams |= set(_ASCII_WORD.findall(re.sub(r"\s+", "", t)))
+    return grams
+
+
+# 多意图连接词：「我妈的糖尿病和我胃病哪个严重」这种句子里有两个主语，
+# 不能因为点了「妈」就把「我」的那条排掉，否则对比题只剩一半。
+_MULTI_RE = re.compile(r"和|跟|与|以及|还有|哪个|谁更|比较|谁大|谁小")
+
+# 接续词：只表示「接着说」，本身不指向任何话题。它们留在 grams 里会让
+# 「后来呢」「然后呢」被当成「这轮有实词」，从而关掉历史补位通道——实测
+# 「后来呢」在上一轮问过车祸之后返回空，因为「后来」两个字被算成了主题。
+_CONT_RE = re.compile(r"后来|然后|接着|于是|接下来|再然后|所以说|所以|那么|继续|还有呢|再说")
+
+
+def _query_has_topic(text: str) -> bool:
+    """这句里有没有指向某个话题的实词（接续词不算）。
+
+    「后来呢」→ 剥掉「后来」只剩「呢」→ 没有话题，该走历史补位。
+    「吃东西」→ 有 → 换了话题，别拿上一轮的答案硬凑。
+    """
+    t = _CONT_RE.sub("", str(text or ""))
+    # 只认长度 ≥2 的：剩下一个「呢」是 _bigrams 对单字的兜底产物，不是话题。
+    return bool({g for g in _content_grams(t) if len(g) >= 2} - _STOP_GRAMS)
+
+
 # ---- query 概念归一（零成本补召回的第一层）----
 # 中文口语的改写问法（「多大了」vs「16岁」）2-gram 字面零重叠，闸门必砍。
 # 这里把常见问法映射到「概念词」，检索前拼接到 query 尾部：原文保留（字面
@@ -84,7 +201,17 @@ _QUERY_CONCEPTS: list[tuple[re.Pattern, str]] = [
         (r"礼物|送过|送了|收过|收到", "礼物 送"),
         (r"去得成|来吗|过来|见面|去找|来访|打算.{0,8}来|暂缓", "来 见面 计划"),
         (r"挣钱|赚钱|收入|工资|生活费|零花", "钱 挣钱"),
-        (r"对象|在一起|男女朋友|恋人|男朋友|女朋友|老婆|老公|前任|分手", "对象 恋爱 关系"),
+        # 问「干啥的 / 什么工作」时，答案在 value 里往往写成「在xx公司做运营」
+        # 「做装修生意」，字面和「工作」零重叠（实测「我是做什么工作的」把
+        # 三条无关记忆拉进包，真答案的 value 里一个「工作」都没有）。
+        (r"工作|上班|职业|干什么的|做什么的|做啥的|干啥的|混哪行", "工作 公司 上班 生意"),
+        # 「老公 / 老婆」是**具体的人**，不是「恋爱」这个概念。原来一起映射到
+        # 「对象 恋爱 关系」，等于每句问伴侣的话都被拼上「恋爱」「关系」——
+        # 实测问「我老公生日是哪天」，答案本该是「老公叫阿强…」，但概念词把
+        # 一条评价（「觉得婆婆管得太多」）也点亮了，还让「生日是农历八月十六」
+        # 稳稳排第一。同义映射只放同义的**称呼**，不放抽象类目。
+        (r"对象|男女朋友|恋人|男朋友|女朋友|前任|老婆|老公|丈夫|妻子",
+         "老公 老婆 对象 丈夫 妻子"),
         (r"留学|出国|哪个国家|加拿大|日本|美国", "留学 国家"),
         (r"音乐|电音|歌曲|编曲|做歌|听歌", "音乐"),
         (r"考试|备考|专升本|升学|读书|上学", "考试 学"),
@@ -292,6 +419,134 @@ def resolve_preview_scope(subject: str, session_id: str, cache_items,
     return "", session_id, False
 
 
+# 硬锚点：只认单字的实体词，2-gram 机制永远撞不上它们。
+#
+# 「我有什么病」问的是「病」，value 写的是「慢性胃炎」——「么病」对「胃炎」
+# 零重叠，整句召回空。「我几岁」对「今年23岁」同理（「几岁」vs「3岁」）。
+# 这类词在中文里就那么几个，而且**只在对应问法下才算数**（「吃饭了吗」里
+# 的「吃」不算，否则又要给每句寒暄塞饮食偏好），所以按问法触发、按字匹配。
+#
+# 权重给 0.45：能过闸，但排在真字面命中之后。单字命中噪音大，不该抢第一。
+_CONCEPT_ANCHORS: list[tuple[re.Pattern, tuple[str, ...]]] = [
+    (re.compile(p), words) for p, words in (
+        (r"多大|几岁|年龄|年纪|岁数", ("岁",)),
+        (r"病|症状|健康|吃药|住院|手术|疼|痛|不舒服", ("病", "炎", "医")),
+        (r"睡|作息|熬夜|失眠|几点起|起床", ("睡", "醒", "熬夜")),
+    )
+]
+
+# ---- 称呼槽位：谁是谁 ----
+# 中文里「我妈」和「婆婆」都是「妈」，可她们是两个人。系统原本没有「这个
+# 人是谁」的概念，全靠字面——只要某条记忆提过「婆婆」，就一样能撞上问句
+# 里的「妈」。实测（0.16.18 前）问「我婆婆身体怎么样」，三条含「婆婆」的
+# 记忆平分，正确答案「婆婆跟我们一起住，有高血压」被「觉得婆婆管得太多」
+# 和「平时都是婆婆做」挤出了包；问「我老公生日是哪天」，直接拿「我自己
+# 的生日」回答，因为库里只有那一条含「生日」。
+#
+# 槽位把称呼归一到「同一个人」：只有落在同一个槽里才算在说这个人。
+# 「我妈」→ mother，「我婆婆」→ mil，两者永不互相匹配。
+#
+# 顺序即优先级：长词必须排在短词前，否则「老公的妈」会被「老公」吃掉、
+# 判成丈夫。「他妈」故意归 mil —— 聊天里说「他妈」几乎都是指婆婆。
+_KIN_SLOTS: tuple[tuple[str, str], ...] = (
+    ("老公的妈", "mil"), ("老公他妈", "mil"), ("婆婆", "mil"),
+    ("家婆", "mil"), ("他妈", "mil"),
+    ("老公的爸", "fil"), ("公公", "fil"),
+    ("孩子他爸", "husband"), ("娃他爸", "husband"),
+    ("老公", "husband"), ("丈夫", "husband"), ("爱人", "husband"),
+    ("儿子", "child"), ("女儿", "child"), ("孩子", "child"),
+    ("小孩", "child"), ("闺女", "child"), ("娃", "child"), ("崽", "child"),
+    ("我妈", "mother"), ("妈妈", "mother"), ("母亲", "mother"),
+    ("老妈", "mother"), ("娘家", "mother"),
+    ("我爸", "father"), ("爸爸", "father"), ("父亲", "father"), ("老爸", "father"),
+    ("弟弟", "brother"), ("我弟", "brother"),
+    ("哥哥", "brother"), ("我哥", "brother"),
+    ("妹妹", "sister"), ("我妹", "sister"),
+    ("姐姐", "sister"), ("我姐", "sister"),
+    ("小姑子", "sil"), ("小姑", "sil"),
+    ("侄女", "niece"), ("侄子", "nephew"),
+    ("奶奶", "grandma"), ("外婆", "grandma"),
+    ("爷爷", "grandpa"), ("外公", "grandpa"),
+)
+_KIN_SLOTS_LONGEST_FIRST = tuple(sorted(_KIN_SLOTS, key=lambda x: -len(x[0])))
+
+# 「这条事实的主语是这个人」的词表。只判开头，且允许「我 / 我家 / 家里」这类
+# 前缀先剥掉（记忆里常写「我妈…」「家里…」）。
+# 和上面那张表分开，是因为判开头必须容忍单字（「妈在梅州」去掉「我」之后
+# 只剩「妈」），而全文匹配不能收单字——「他妈」会被拆成 mother。
+_HEAD_TERMS: tuple[tuple[str, str], ...] = (
+    ("老公的妈", "mil"), ("婆婆", "mil"), ("家婆", "mil"), ("他妈", "mil"),
+    ("老公的爸", "fil"), ("公公", "fil"),
+    ("老公", "husband"), ("丈夫", "husband"), ("爱人", "husband"),
+    ("儿子", "child"), ("女儿", "child"), ("孩子", "child"),
+    ("小孩", "child"), ("闺女", "child"), ("娃", "child"), ("崽", "child"),
+    ("妈", "mother"), ("娘", "mother"), ("爸", "father"), ("爹", "father"),
+    ("弟弟", "brother"), ("哥哥", "brother"),
+    ("妹妹", "sister"), ("姐姐", "sister"),
+    ("小姑", "sil"), ("侄女", "niece"), ("侄子", "nephew"),
+    ("奶奶", "grandma"), ("外婆", "grandma"),
+    ("爷爷", "grandpa"), ("外公", "grandpa"),
+)
+_HEAD_TERMS_LONGEST_FIRST = tuple(sorted(_HEAD_TERMS, key=lambda x: -len(x[0])))
+_HEAD_PREFIXES = ("我的", "我家", "我", "咱家", "咱", "家里", "家")
+
+
+def _kin_slots(text: str) -> set[str]:
+    """一段中文里出现过的称呼 → 槽位集合。长词优先，一个字只归一次。"""
+    t = str(text or "")
+    if not t:
+        return set()
+    taken = [False] * len(t)
+    slots: set[str] = set()
+    for term, slot in _KIN_SLOTS_LONGEST_FIRST:
+        i = t.find(term)
+        while i >= 0:
+            if not any(taken[i:i + len(term)]):
+                slots.add(slot)
+                for k in range(i, i + len(term)):
+                    taken[k] = True
+            i = t.find(term, i + 1)
+    return slots
+
+
+def _head_slots(text: str) -> set[str]:
+    """这条事实的**主语**是谁 —— 只看 value 开头，不看中间。
+
+    「婆婆跟我们一起住，有高血压」→ mil（在讲婆婆）
+    「觉得婆婆管得太多」        → 空（在讲我的看法，只是顺带提到她）
+    「生儿子的时候是剖腹产」    → 空（是我的经历）
+    分不开这两种，问「婆婆身体怎么样」就会被我的评价抢走。
+    """
+    t = str(text or "").strip()
+    for p in _HEAD_PREFIXES:
+        if t.startswith(p):
+            t = t[len(p):].lstrip("的了")
+            break
+    for term, slot in _HEAD_TERMS_LONGEST_FIRST:
+        if t.startswith(term):
+            return {slot}
+    return set()
+
+# 态度谓词：喜欢 / 觉得 / 认为 / 想要 / 知道。它们在记忆里出现的频率极高
+# （几乎每条评价都带一个），而且**不指向任何具体对象**——「喜欢」本身不是
+# 话题，「喜欢什么」才是。
+#
+# 实测「我最喜欢什么颜色」：靠「喜欢」这一个词撞出三条「喜欢 X」的记忆
+# （推理小说 / 说话直说 / 胶片摄影），模型拿着它们会答「你喜欢胶片摄影」，
+# 问颜色答摄影，比空手更糟。库里根本没记过颜色。
+#
+# 不放进 _STOP_GRAMS：它们是别的好句子里唯一的锚点（「我讨厌什么样的人」
+# 靠「讨厌」找到那条评价）。这里只在**整句命中全是这类词**时判定「这轮
+# 没有可检索的实体」，闸门放行与否看 _rel_strong。
+_WEAK_CHARS = set("喜欢觉得认想要知道感觉在意希望")
+
+
+def _is_weak_gram(g: str) -> bool:
+    """除功能字外全是态度字 → 这个 bigram 不指向任何实体。"""
+    chars = [c for c in str(g) if c not in _FUNC_CHARS]
+    return bool(chars) and all(c in _WEAK_CHARS for c in chars)
+
+
 class PackBuilder:
     def __init__(self, store, l3_snippets: int = 0, excluded_limit: int = 5,
                  l2_limit: int = 12, subject: str = "", session_id: str = "",
@@ -452,22 +707,76 @@ class PackBuilder:
                   context: str = "") -> list[dict]:
         """给 L2 候选打分。
 
-        四个和旧版不同的地方，都是为了避免「不同量纲直接相加」：
+        三路命中必须分开计数，绝不合并成一个数（0.16.16 的关键修正）：
+          本轮本体 qg∩content —— 主判据，决定「这轮到底在说什么」；
+          历史本体 cg∩content —— 只给指代追问（「那它呢」）补位，不能顶替本轮；
+          问法别名 qall∩alias —— 兜底通道，整句口语别名撞上一个泛用词不算命中。
+        合并的后果实测过：「吃东西」那轮，上一轮的「插件开发」还在
+        recent_queries 里，#45「开发了记忆系统插件」靠两个历史词拿到
+        w=2.16，排在有真命中的「不喜欢吃泡面」前面，被补进尾部当噪声。
+
+        另外四条老规矩保持不变：
           1) bigram 命中按 IDF 加权（候选池内的文档频率），「的/了/是」自动降权；
           2) 加权相关度在本查询内 min-max 归一，长 value 不再靠字数天然领先；
           3) 置信度 / 保留度各自只占 0.15，不再当常量偏移主导排序；
-          4) 最近几轮原话按 0.4 权重补召回，本轮原话仍是主判据。
-        _rel 保留「命中数」语义给 _filter_by_relevance 的闸门和 _count_hit 用。
+          4) 本轮原话仍是主判据，历史只按折扣补位。
+        _rel 的语义已改为「本轮本体命中数」，_filter_by_relevance 的闸门、
+        _pick_l2 的「本轮真的被提到」判据都用它。
         """
-        qg = _bigrams(query)
-        cg = _bigrams(context) if context else set()
+        # 本轮原话 和 概念归一拼上来的词，分开算。
+        #
+        # 概念词是「猜测」：把「多大」猜成「岁」、把「干啥的」猜成「工作」。
+        # 猜得中能救回零重叠的整句，猜不中就直接制造误命中——实测问「我在
+        # 哪上班」，概念词「工作」点亮了「想换工作，嫌现在厂里太远」（3.26
+        # 分），真答案「在顺德一家五金厂做会计」只能靠别名拿 1.96 分，问在
+        # 哪上班答想换工作。原话里一个字都没提到的东西，凭什么比别名更硬。
+        _raw_q, _sep, _concept_q = str(query or "").partition(_CONCEPT_MARK)
+        # 接续词在检索里也要剥掉，不只是判「有没有话题」时剥。实测「后来呢」
+        # 期望接着上一轮说手术，结果被一条「在地铁上丢过一部手机，**后来**
+        # 没找回来」抢走——记忆里出现「后来」是正常叙述，问句里出现「后来」
+        # 就只是「接着说」。
+        qg_raw = _content_grams(_CONT_RE.sub("", _raw_q))
+        qg_con = _content_grams(_concept_q) if _sep else set()
+        qg = qg_raw | qg_con
+        cg = _content_grams(context) if context else set()
         qall = qg | cg
-        grams = [_bigrams(_l2_text(r)) for r in rows]
-        cgrams = [_bigrams(_l2_content(r)) for r in rows]
+        # 单字锚点只在「本轮原话」里判，不看历史：上一轮问过病，这一轮
+        # 只是在聊别的，不该继续往包里塞病历。
+        raw_q = _raw_q
+        anchor_words: list[str] = []
+        for _pat, _words in _CONCEPT_ANCHORS:
+            if _pat.search(raw_q):
+                anchor_words.extend(w for w in _words if w not in anchor_words)
+        # 问句点了谁。没点人（「我有什么病」）就是空集，下面所有主体逻辑跳过。
+        q_slots = _kin_slots(raw_q)
+        # 上一轮点的是谁。「那他呢」「后来呢」本轮没有主体，得接着上一位说，
+        # 否则 IDF 会把「想换工作」这种稀有词派上去，答成我自己的工作。
+        h_slots = _kin_slots(context) if (context and not q_slots) else set()
+        grams = [_content_grams(_l2_text(r)) for r in rows]
+        cgrams = [_content_grams(_l2_content(r)) for r in rows]
+        agrams = [_content_grams(_l2_alias(r)) for r in rows]
+        # 主体名单独一路：问「老周呢」「老周最近怎么样」时，全句唯一的实词
+        # 就是人名，而这个字只出现在 subject 里、不在 value 里（value 记的是
+        # 「本名周维，做装修生意」）。不算这一路，点名人名等于没点名——实测
+        # 「老周是干什么的」整句零命中，返回空。
+        # 只对**别人**生效：自己名字出现在句句里都可能（「阿岚今天好累」），
+        # 算了会让全库每一行都 +1，闸门形同虚设。
+        sgrams = [_content_grams(str(r.get("subject") or "")) for r in rows]
+        # 句末焦点：中文问句的信息重心通常在最后几个字（「…加糖吗」的重点是
+        # 糖，「…辞职吗」的重点是辞职）。命中它的行给一点加分，用来分开
+        # 「沾到同一个话题」和「答的就是这一问」——实测「我打算辞职吗」，
+        # 「打算明年搬到杭州」靠「打算」两个字和「在考虑辞职」打平，然后靠
+        # 置信度赢了，答非所问。只加分，不做闸门。
+        # 窗口只取最后 3 个字。取 5 个会把「打算辞职吗」里的「打算」也算进
+        # 焦点，「打算明年搬到杭州」跟着白拿一份加分，和「在考虑辞职」打平。
+        tail_g = _content_grams(raw_q[-3:]) - _STOP_GRAMS if raw_q else set()
         if not qall:
             for r in rows:
                 r["_rel"] = 0
                 r["_rel_content"] = 0
+                r["_rel_ctx"] = 0
+                r["_rel_alias"] = 0
+                r["_rel_name"] = 0
                 r["_rel_w"] = 0.0
                 base = (float(r.get("confidence", 0) or 0)
                         + min(int(r.get("stability", 0) or 0), 5) * 0.1
@@ -482,31 +791,111 @@ class PackBuilder:
             return sorted(rows, key=lambda r: r["_score"], reverse=True)
         n = max(1, len(rows))
         if self.idf_enabled:
+            # df 只在「本体」里统计：alias 是模型生成的三句口语，算进 df
+            # 会把「东西 / 其实」这类词的文档频率抬高、权重压低，但它们本来
+            # 也不该靠 alias 拿分，压不压无所谓；真事实词的 df 反而更干净。
             w = {}
             for g in qall:
                 df = sum(1 for s in grams if g in s)
-                w[g] = math.log(1.0 + n / (1.0 + df)) * (1.0 if g in qg else 0.4)
+                w[g] = math.log(1.0 + n / (1.0 + df))
         else:
-            w = {g: (2.0 if g in qg else 0.8) for g in qall}
+            w = {g: 2.0 for g in qall}
         intent_rel = bool(_REL_Q.search(query))
         intent_time = bool(_TIME_Q.search(query))
         intent_fact = bool(_FACT_Q.search(query))
-        rel_ws: list[float] = []
-        for r, tg, ctg in zip(rows, grams, cgrams):
-            hits = qall & tg
+
+        def _sat(hs: set[str]) -> float:
             # 长 value 天然能蹭到更多 bigram，裸求和会让它永远压过
             # 「喜欢喝拿铁」这种只命中一两个稀有词的短事实。按命中数做
             # 次线性饱和：命中越多边际收益越低，短答案才有机会排上来。
-            rw = (sum(w.get(g, 0.0) for g in hits)
-                  / (1.0 + 0.35 * max(0, len(hits) - 1)))
+            return (sum(w.get(g, 0.0) for g in hs)
+                    / (1.0 + 0.35 * max(0, len(hs) - 1)))
+
+        rel_ws: list[float] = []
+        for r, tg, ctg, ag, sg in zip(rows, grams, cgrams, agrams, sgrams):
+            _val = str(r.get("value") or "")
+            # 这条在说谁。问句点了人时，槽位对不上就是「答的不是这个人」。
+            # subject 也算：subject=「婆婆」的档案行，value 里写的是「本名
+            # 李桂芳」，不提称呼，但这条事实本来就是婆婆的。
+            _subj_slots = _kin_slots(str(r.get("subject") or ""))
+            r_slots = _kin_slots(_val) | _subj_slots
+            r["_slots"] = r_slots
+            same = q_slots & r_slots if q_slots else set()
+            hits_q = (qg_raw & ctg) - _STOP_GRAMS      # 本轮原话：主判据
+            # 概念词猜出来的命中单独一路、单独打折。它回答的是「这句可能在问
+            # 什么」，不是「这句提到了什么」。
+            hits_con = ((qg_con & ctg) - hits_q) - _STOP_GRAMS
+            hits_c = ((cg & ctg) - hits_q - hits_con) - _STOP_GRAMS   # 历史本体：只补位
+            # 别名只认本轮问法：历史词走 ctx 通道，混进来会让上一轮的话题
+            # 借别名的壳复活（「吃东西」+ 上轮「拿铁」，别名里撞到「东西」和
+            # 「拿铁」两个 bigram，就够格当兜底了）。概念词也不进：别名是模型
+            # 写的口语，概念词是规则猜的，两个猜的东西叠一起等于自证。
+            hits_a = ((qg_raw & ag) - hits_q) - _STOP_GRAMS    # 本轮撞上别名：兜底
+            # 人名通道：只算别人。名字命中说明「这一条就是在说被点名的人」，
+            # 但不算内容被提起（_rel_content 仍是 0，统计轨不会因此加一次）。
+            hits_n = set()
+            if (str(r.get("subject") or "").strip()
+                    and str(r.get("subject") or "").strip() != self.subject):
+                hits_n = (qg_raw & sg) - hits_q - _STOP_GRAMS
+            # 单字锚点：只在本轮问法命中时才算，且问某位亲属时只认**这一位**
+            # （问「我妈有什么病」，自己那条「慢性胃炎」也含「病」，婆婆那条
+            # 含「高血压」——都不该靠一个「病」字混进来）。
+            aw: list[str] = []
+            if anchor_words and (not q_slots or same):
+                aw = [w for w in anchor_words if w in _val]
+            # 主体权重：同一句话，主语是这个人 和 顺带提到这个人，差别很大。
+            # 「婆婆跟我们一起住，有高血压」才是答案；「觉得婆婆管得太多」
+            # 是态度；「平时都是婆婆做」是家务分工。三条都含「婆婆」，字面
+            # 分不开，只能靠抬头判。
+            slot_w = 0.0
+            if q_slots:
+                # subject 本身就是这个人（「婆婆」名下的档案行）和「value 抬头
+                # 是这个人」等价：那条事实本来就是他的，不该因为 value 写成
+                # 「本名李桂芳，今年六十八」不带称呼就被当成顺带一提。
+                if (_head_slots(_val) & q_slots) or (_subj_slots & q_slots):
+                    slot_w = 0.80
+                elif same:
+                    slot_w = 0.25
+            # 纯指代追问（「那他呢」「后来呢」）：沿用上一轮那个人。
+            ctx_slot_w = 0.0
+            if h_slots:
+                if (_head_slots(_val) & h_slots) or (_subj_slots & h_slots):
+                    ctx_slot_w = 0.80
+                elif r_slots & h_slots:
+                    ctx_slot_w = 0.20
+            # 折扣写在这里而不是 w 里：w 只放 idf，三种命中的量纲才可比。
+            # 别名只在**这一行自己没有任何本体/锚点命中**时才算数——兜底通道
+            # 的语义就是「别的路都走不通才用它」。整池一起判太粗：实测
+            # 「我喝咖啡加糖吗」，池子里有「空腹喝咖啡」那条命中了咖啡，于是
+            # 别名通道被整体关掉，真正答「不加糖」的那条反而掉到第二。
+            _alias_w = 0.30 if not (hits_q or hits_con or aw) else 0.0
+            # 句末焦点命中按 0.55 计入相关度：它回答的是「问的那一点」。
+            # 平摊成固定加分不够用——「我喝咖啡加糖吗」里「空腹喝咖啡」命中
+            # 「喝咖 + 咖啡」两个词，归一后直接 1.0，压过只命中「加糖」的
+            # 那条正确答案。焦点词必须能翻盘，才算真的在看这一问。
+            rw = (_sat(hits_q) + 0.55 * _sat(hits_con) + 0.45 * _sat(hits_c)
+                  + _alias_w * _sat(hits_a)
+                  + 0.70 * _sat(hits_n) + 0.45 * min(3, len(aw))
+                  + 0.55 * _sat(hits_q & tail_g) + slot_w + ctx_slot_w)
             rel_ws.append(rw)
-            r["_rel"] = len(hits)
-            r["_rel_content"] = len(qall & ctg)
+            r["_rel"] = len(hits_q) + len(hits_con) + len(hits_n) + len(aw)
+            r["_rel_content"] = len(hits_q) + len(hits_con) + len(aw)
+            r["_rel_ctx"] = len(hits_c)
+            r["_rel_alias"] = len(hits_a)
+            r["_rel_name"] = len(hits_n)
+            r["_rel_concept"] = len(hits_con)
+            # 实体命中数：扣掉纯态度词。闸门看这个，不看 _rel ——
+            # 否则一句「我最喜欢什么颜色」靠「喜欢」就能过闸进包。
+            # 主体相符也算一票：「我生过孩子吗」字面撞不到「生儿子的时候是
+            # 剖腹产」，但那条确实是答案，放它过闸才有机会被看到。
+            r["_rel_strong"] = (sum(1 for g in (hits_q | hits_con)
+                                    if not _is_weak_gram(g))
+                                + len(hits_n) + len(aw) + (1 if same else 0))
             r["_rel_w"] = rw
         lo, hi = min(rel_ws, default=0.0), max(rel_ws, default=0.0)
         span = hi - lo
         concept = _CONCEPT_MARK in query
-        for r, rw in zip(rows, rel_ws):
+        for r, rw, ctg in zip(rows, rel_ws, cgrams):
             norm = (rw - lo) / span if span > 0 else 0.0
             conf = float(r.get("confidence", 0) or 0)
             ret = retention_score(r)
@@ -518,14 +907,61 @@ class PackBuilder:
                 bonus, why_intent = 0.05 * min(1.0, ret), "time"
             elif intent_fact and r.get("_rel_content"):
                 bonus, why_intent = 0.04, "fact"
+            if tail_g & ctg:
+                why_intent = why_intent or "tail"
             r["_score"] = 0.70 * norm + 0.15 * conf + 0.15 * ret + bonus
-            ch = ("alias" if (qall & _bigrams(str(r.get("ask_alias") or "")))
-                  else "concept" if concept else "literal")
+            # 主体冲突：问句点了某个人，这条记忆里压根没有这个人（提的是别人，
+            # 或者通篇在讲我自己）→ 不是答案。实测「我老公生日是哪天」，库里
+            # 只有「生日是农历八月十六」，字面命中「生日」「日是」，0.93 分
+            # 稳坐第一，模型就会答「你老公生日是农历八月十六」。
+            #
+            # 只降权不删除：「我妈的糖尿病和我胃病哪个严重」需要两边都在，
+            # 一刀切掉就答不成对比题了。0.55 足够让 0.93 的噪声让位给 0.70
+            # 的正确答案，又不至于把它踢出包。
+            subj_pen = 1.0
+            if raw_q.strip():
+                if q_slots:
+                    if not ((r.get("_slots") or set()) & q_slots):
+                        subj_pen = 0.55
+                        # 标记「问的是别人，这条不是那个人」。排除是后面
+                        # _filter_by_relevance 的事：只有池里确有这个人的
+                        # 档案时才敢排掉别人的，否则会把仅有的线索也删光。
+                        r["_subj_off"] = True
+                elif not h_slots and _head_slots(str(r.get("value") or "")):
+                    # 问句里没点人 = 在问我自己。主语是「妈妈」「弟弟」「婆婆」
+                    # 的行是**别人的档案**，不能拿去回答「我有什么病」——
+                    # 实测排第一的是「妈妈今年五十二，有糖尿病」，模型张口就
+                    # 说「你有糖尿病」。
+                    # 只看抬头，不看整句：自己那条「生完孩子胖了二十斤」中间
+                    # 也有「孩子」，但它讲的是我的事，不该降权。
+                    # h_slots 非空是例外：那是「那她呢」「后来呢」这种纯指代
+                    # 追问，上一轮点的就是别人，这正是要捞的档案。
+                    subj_pen = 0.55
+            if subj_pen != 1.0:
+                r["_score"] = float(r["_score"]) * subj_pen
+            # 同分破平：两条都只撞到同一个泛词时（「我一个月挣多少钱」，
+            # 「房贷每个月还四千二」和「一个月工资六千八」都只撞「个月」），
+            # 归一后双双 1.0、连 conf 和 stability 都一样，谁排前面全看
+            # 数据库返回顺序。这时别名命中数是最可靠的区分：模型给这条写了
+            # 五句口语问法，恰好撞上这一问的，比只碰上一个「个月」更像答案。
+            # 系数压到 1e-3 量级，只在真同分时起作用，不改变正常排序。
+            r["_score"] = (float(r["_score"])
+                           + 0.0012 * min(6, int(r.get("_rel_alias") or 0)))
+            rel_q = int(r.get("_rel") or 0)
+            ch = ("concept" if rel_q and concept
+                  else "literal" if rel_q
+                  else "context" if int(r.get("_rel_ctx") or 0)
+                  else "alias" if int(r.get("_rel_alias") or 0)
+                  else "none")
             r["_why"] = {
-                "channel": ch, "bigram": int(r["_rel"]), "idf": round(rw, 3),
+                "channel": ch, "bigram": rel_q, "idf": round(rw, 3),
                 "norm": round(norm, 3), "confidence": round(conf, 3),
                 "retention": round(ret, 3), "intent": why_intent,
                 "bonus": round(bonus, 3), "mmr": "", "consensus": 0.0,
+                "tail": 1 if (tail_g & ctg) else 0,
+                "subj_pen": subj_pen,
+                "rel_ctx": int(r.get("_rel_ctx") or 0),
+                "rel_alias": int(r.get("_rel_alias") or 0),
                 "score": round(float(r["_score"]), 4),
             }
         return sorted(rows, key=lambda r: r["_score"], reverse=True)
@@ -533,8 +969,11 @@ class PackBuilder:
     def _apply_mmr(self, rows: list[dict], lam: float = 0.7) -> list[dict]:
         """L2 之间去冗余：同一件事被总结成三条近重复会白占三个名额。
 
-        用 value + 问法别名的 bigram Jaccard 判重复；带独有数字的细节
-        （「九十分钟」）视为不同信息，不让位。纯 Python，零额外查询。
+        只比 value。**不能带 ask_alias** —— 重叠系数是 |交集| / 较短者，
+        别名是模型写的三句口语（动辄 40+ 个 bigram），把它算进来分母被撑到
+        两倍多，#9「开发了记忆插件」和 #45「开发了记忆系统插件」这种真近重复
+        只有 0.1，永远判不出来（实测就是这样，两条一起占掉尾部两个名额）。
+        带独有数字的细节（「九十分钟」）视为不同信息，不让位。
         """
         if not self.mmr_enabled or len(rows) < 2:
             return rows
@@ -542,7 +981,7 @@ class PackBuilder:
         kept_grams: list[set[str]] = []
         kept_units: list[set[str]] = []
         for r in rows:
-            text = f"{r.get('value') or ''}{r.get('ask_alias') or ''}"
+            text = str(r.get("value") or "")
             g = _bigrams(text)
             units = set(_NUM_RE.findall(text))
             dup = False
@@ -567,13 +1006,20 @@ class PackBuilder:
     def _filter_by_relevance(self, rows: list[dict], query: str = "") -> list[dict]:
         """按本轮话题命中数砍掉「压根没被提到」的条目。
 
-        只看 2-gram 命中数（_rel），不看 _score：_score 里混了置信度和稳定性，
+        只看命中数（_rel 本轮本体），不看 _score：_score 里混了置信度和稳定性，
         即使一句话都没命中也会有 0.9 分，用它做阈值等于没设。
-        本轮一个都没命中（闲聊、"在吗"）时不过滤，交给预算按保底条数裁。
+
+        本体零命中有四级退路，顺序是「越准的越前」：
+          语义钩子（若配了 provider）→ 问法别名（撞 ≥2 词）→
+          历史本体（仅当本轮挑不出实词）→ 按 _score 保底 3 条。
+        保底那几条 _rel 是 0，注入轨的候选条件会把它们挡在尾部之外，
+        只用于「常驻包总得有几条垫底」。
         """
         if self.rel_ratio <= 0 or not rows:
             return rows
-        top = max(int(r.get("_rel", 0)) for r in rows)
+        qg = _content_grams(query)
+        q_slots_ctx = _kin_slots(query)
+        top = max(int(r.get("_rel_strong", r.get("_rel", 0)) or 0) for r in rows)
         if top <= 0:
             keep = min(self.l2_keep_min, len(rows))
             # 语义兜底：字面/概念/别名全零命中时，问 semantic_fn 要一个
@@ -601,35 +1047,93 @@ class PackBuilder:
                             r["_score"] = max(float(r.get("_score", 0) or 0),
                                               0.4 + 0.6 * s)
                         return picked
-            # 整句话一个 2-gram 都没命中：判断不了相关性，只给保底条数（按置信度
-            # 挑最可信的几条）。别整池子扔进去 —— 一句「在吗，今天干嘛呢」塞
-            # 8 条无关事实，AI 会在一句打招呼里强行背资料卡。
+            # 本体零命中不等于没话题：「多大了」在值里撞不到任何 bigram，
+            # 但 alias（模型写的口语问法「今年多大了呀」）能撞上。此时才
+            # 允许别名兜底，且要求至少 2 个 bigram —— alias 是整句口语，
+            # 只撞一个词纯属巧合（「嘿嘿想你了」撞别名里的「你了」）。
+            # 本体有命中的轮次完全不看 alias，这就是 0.16.16 堵住噪声的闸门。
+            alias_rows = sorted(
+                (r for r in rows if int(r.get("_rel_alias") or 0) >= 2),
+                key=lambda r: -float(r.get("_rel_w") or 0))
+            if alias_rows:
+                return alias_rows[:keep]
+            # 再退一步：只有本轮这句话里压根挑不出实词（「那它呢」「后来呢」
+            # 「那个呢」），才用历史轮的原话补位。本轮有实词（「吃东西」）却
+            # 零命中，说明库里没这条，别拿上一轮的话题硬凑 —— 否则换了话题
+            # 还挂着上一条，用户一眼就看出是噪声。
+            # 判据是「剥掉接续词后还剩不剩实词」：「后来呢」剩个「呢」，
+            # 不算话题，得接着上一轮说；原来的 `not qg` 判不出来，因为
+            # 「后来」本身是两个实字。
+            if not _query_has_topic(query):
+                ctx_rows = sorted(
+                    (r for r in rows if int(r.get("_rel_ctx") or 0) > 0),
+                    key=lambda r: -float(r.get("_rel_w") or 0))
+                if ctx_rows:
+                    return ctx_rows[:keep]
+            # 整句话一个 2-gram 都没命中：判断不了相关性。
+            #
+            # **有 query 就一条不垫**（0.16.17）。原来这里无条件返回
+            # rows[:keep]，而 rows 按 _score 排，头部恒为「自我相关 + 高稳定」
+            # 那几条，于是每一句「在吗」「嘿嘿想你了」「吃饭了吗」都会带上
+            # 「本名陈岚 / 今年23岁 / 现在住在成都」——206 token 的固定身份卡，
+            # 九句问候九次一模一样。这不是「保底」，是每轮强行背资料卡。
+            # 真没答案的句子，空着比塞三条无关事实好：模型手里没有资料，
+            # 就不会在一句打招呼里突然自我介绍。
+            #
+            # query 为空是另一回事：常驻包 / 面板预览本来就没有话题，那几条
+            # 永久事实正是它该有的内容，保底逻辑保留。
+            if str(query or "").strip():
+                return []
             return rows[:keep]
         # top 取自整个候选池（0.16.0 起不再预截断），一条长 value 蹭到 6~8
         # 个 bigram 就能把阈值抬到 2.4，短答案只命中 1~2 个的会被误杀。
         # 天花板按本轮 query 自己的 bigram 数算，再压一个绝对上限 3：
         # 命中 3 个已经是强信号，再往上要求只会漏召回。放宽闸门不会把噪声
         # 放进包——后面还有 _pick_l2 按 _score 取前 N 和预算裁剪。
-        qg = _bigrams(query)
         cap = max(1, len(qg)) if qg else top
         th = min(2.0, max(1.0, min(top, cap) * self.rel_ratio))
-        kept = [r for r in rows if int(r.get("_rel", 0)) >= th]
+        kept = [r for r in rows
+                if int(r.get("_rel_strong", r.get("_rel", 0)) or 0) >= th]
+        # 问的是某个人，池里确实有这个人的档案 → 别人的一律不进包。
+        # 只靠 0.55 降权不够：「我老公生日是哪天」里我自己的生日 0.93 分，
+        # 乘完还有 0.51，照样压过 0.70 分的伴侣档案，模型就会答错人。
+        # 多意图（「我妈的糖尿病和我胃病哪个严重」）不排，两边都要。
+        if q_slots_ctx and not _MULTI_RE.search(query):
+            mine = [r for r in kept if not r.get("_subj_off")]
+            if mine and len(mine) < len(kept):
+                kept = mine
         # 短事实往往只有一两个 bigram 命中，可那可能正是答案本身。长噪声
         # 把 top 撑高时，相对阈值等于宣布「短事实永不进包」。显式把内容
         # 真的命中过的落选行按分数补回来，后面还有 _pick_l2 和预算裁剪，
         # 不会因为放宽闸门把包撑大。
         kept_ptr = {id(r) for r in kept}
+        # 补回来的有两类，原来只补第一类：
+        #   ① 本体真命中过、被相对阈值卡掉的短事实；
+        #   ② 靠问法别名撞了 ≥2 个词的兜底行。
+        # 第二类原来只在「整池零命中」时才启用，于是池子里只要有一条泛词命中
+        # 就全废：实测问「我以前做什么工作」，先被拼上概念词「工作」，命中
+        # 一条「想换工作」，于是真答案「以前在电子厂做过六年统计」（别名撞了
+        # 5 个词）连包都进不来。
         weak = [r for r in rows if id(r) not in kept_ptr
-                and int(r.get("_rel_content") or 0) > 0]
+                and not r.get("_subj_off")
+                and (int(r.get("_rel_strong", r.get("_rel_content", 0)) or 0) > 0
+                     or (int(r.get("_rel_alias") or 0) >= 2
+                         # 别名兜底不许跨人：问「我婆婆喜欢吃什么」，一条
+                         # 「特别爱吃甜的」靠别名「我爱吃什么」也撞了两个
+                         # 词，照样被补进包 —— 问婆婆口味答我爱吃甜的。
+                         and (not q_slots_ctx
+                              or (r.get("_slots") or set()) & q_slots_ctx)))]
         if weak:
             kept.extend(sorted(weak,
                                key=lambda r: -float(r.get("_score") or 0))
                         [:max(1, self.l2_keep_min)])
         if len(kept) >= min(self.l2_keep_min, len(rows)):
             return kept
-        # 过滤太狠（只剩一两条）时补足到保底条数，取分最高的那几条。
-        # 注意不能像早期版本那样直接退回整个 rows —— 那等于把 40 条噪声
-        # 全放回池子，过滤白设，最后还是靠预算随机砍。
+        # 过滤太狠（只剩一两条）时，原来会补足到保底条数。有 query 就不补：
+        # 只有 1 条真答案就交 1 条，凑满 3 条只会把「本名/年龄」这类零相关
+        # 的常驻事实塞回包里。query 为空（常驻包 / 面板预览）才需要垫底。
+        if str(query or "").strip():
+            return kept
         return rows[: min(self.l2_keep_min, len(rows))]
 
     def _pick_l2(self, rows: list[dict], pool: list[dict],
@@ -660,7 +1164,19 @@ class PackBuilder:
             return str(r.get("predicate") or "").strip() in PERMANENT_PREDICATES
 
         def _relevant(r: dict) -> bool:
-            return int(r.get("_rel", 0) or 0) > 0
+            """这条算不算「本轮真的在问的东西」。
+
+            必须把别名 / 上下文 / 语义三条通道一起算进来。只看 _rel（本体
+            字面命中）时，靠别名召回的答案会被判成「零相关」，然后被一个
+            零相关的永久事实（本名/年龄）顶掉 —— 实测「我会什么乐器」把
+            「会弹木吉他」（alias 命中 4 个 bigram）换成了「本名陈岚」，
+            「那它呢」把「养了一只橘猫」（ctx 命中）换成了「今年23岁」。
+            别名兜底刚刚捞回来的东西，转头就被这里扔掉，等于没做。
+            """
+            return (int(r.get("_rel") or 0) > 0
+                    or int(r.get("_rel_ctx") or 0) > 0
+                    or int(r.get("_rel_alias") or 0) > 0
+                    or bool(r.get("_sem")))
 
         quota = min(4, max(1, limit // 3))
         n_perm = sum(1 for r in head if _perm(r))
