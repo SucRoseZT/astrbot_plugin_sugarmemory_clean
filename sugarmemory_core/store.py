@@ -905,6 +905,7 @@ class SugarStore:
             ("cfg_ver", "TEXT NOT NULL DEFAULT ''"),
             ("rebuild_reason", "TEXT NOT NULL DEFAULT ''"),
             ("prefix_sig", "TEXT NOT NULL DEFAULT ''"),
+            ("has_image", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in tok_cols:
                 self._db.execute(f"ALTER TABLE token_usage ADD COLUMN {col} {ddl}")
@@ -3710,7 +3711,8 @@ class SugarStore:
                      session_id: str = "", total: int | None = None,
                      ts: float | None = None, arch_ver: str = "", inject_fp: str = "",
                      rebuilt: int = 0, freeze_rounds: int = 0, cfg_ver: str = "",
-                     rebuild_reason: str = "", prefix_sig: str = "") -> int:
+                     rebuild_reason: str = "", prefix_sig: str = "",
+                     has_image: int = 0) -> int:
         """记一条用量。source=actual 是 provider 报的真实 usage，estimate 是我们估的。
 
         arch_ver/inject_fp/rebuilt/freeze_rounds/cfg_ver/rebuild_reason 只对
@@ -3727,14 +3729,14 @@ class SugarStore:
             cur = self._db.execute(
                 "INSERT INTO token_usage (ts, module, source, provider_id, subject, session_id,"
                 " input, cached, output, total, arch_ver, inject_fp, rebuilt, freeze_rounds,"
-                " cfg_ver, rebuild_reason, prefix_sig) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cfg_ver, rebuild_reason, prefix_sig, has_image) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (float(ts or time.time()), str(module or "other")[:32], str(source or "actual")[:16],
                  str(provider_id or "")[:64], str(subject or "")[:40], str(session_id or "")[:120],
                  int(input or 0), int(cached or 0), int(output or 0), max(0, total),
                  str(arch_ver or "")[:16], str(inject_fp or "")[:32],
                  1 if rebuilt else 0, max(0, int(freeze_rounds or 0)),
                  str(cfg_ver or "")[:32], str(rebuild_reason or "")[:24],
-                 str(prefix_sig or "")[:32]),
+                 str(prefix_sig or "")[:32], 1 if has_image else 0),
             )
             return int(cur.lastrowid)
 

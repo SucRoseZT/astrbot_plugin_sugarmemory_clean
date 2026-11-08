@@ -12,7 +12,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import ProviderRequest
-from quart import send_file
+from quart import Response, send_file
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -217,6 +217,12 @@ CFG_ITEMS = [
      "AI 往「刚刚还在聊天的会话」发的不带标记消息（分段回复、send 工具的碎碎念）"
      "不再记成「主动发送」——那些话就在当前对话里，再记一遍会把转述通道堵死，"
      "真转述反而被挤丢。带标记的转述/定时任务永远照记。0 = 关闭去重，全部照记"),
+    ("outbound_bridge_token", "主动发言联动凭证", "str", "memory",
+     "给「别的插件主动替 AI 发的消息」用的绑定凭证。填一个自定义字符串后，本插件会把凭证"
+     "写进数据目录 outbound_bridge.json；对方插件发送前读它、挂在 "
+     "message_chain._sugarmemory_bridge 上（带 token），这边校验一致就跳过 120 秒回声去重、"
+     "强制记成「你主动发给xxx」。不填＝不启用，行为跟以前完全一样。凭证只是多插件之间"
+     "对暗号，不是密码，别用真实密钥"),
     ("bot_isolation", "多机器人记忆隔离", "bool", "memory",
      "一台 AstrBot 跑多个机器人账号（多个平台实例，各自一个 QQ 号）时，记忆按机器人"
      "分开：A 的定时任务、转述和对话不会被 B 的记忆包读到，B 也查不到 A 发过什么。"
@@ -281,6 +287,17 @@ CFG_ITEMS = [
      "块跟上一次挂出去的一模一样，就原样复用，一个字节都不重算；不一样才重建。"
      "关掉＝每轮无条件重算 query=\"\" 的常驻包，等于放弃冻结，只用于排查缓存问题。"
      "建议保持开启"),
+    ("inject_freeze_min_seconds", "记忆包最小复用时长（秒）", "int", "inject",
+     "可选节流：大于 0 时，记忆包在上次重建后至少复用这么久。窗口内「跨会话近况 / "
+     "转述 / 摘要 / 话题尾部」这类流水段即使变了，也先沿用上一轮真正挂出去的块，"
+     "到点再一次性换上，避免每轮都把 system 加整段历史的前缀缓存冲掉。"
+     "只压 fp_changed；长期事实真被改写（l2_changed）、改配置、插件重载一律立即重建，"
+     "新记住的事实不会迟到。检索/召回照跑，只是不立刻写进 prompt。"
+     "默认 180；0 = 关闭节流，完全回到「fp 变即重建」的原行为（机动性最高）。"
+     "值越小越机动：80 秒约等于密集聊天时 6~8 轮换一次包"),
+    ("inject_freeze_max_rounds", "节流最多复用几轮", "int", "inject",
+     "上一项的轮数兜底：聊得很快时，复用满这么多轮就允许重建，不必等满秒数。"
+     "0 = 不限轮数，纯按上面的秒数。想还原旧版「180 秒 / 12 轮」就填 12"),
     ("inject_budget_tokens", "注入预算", "int", "inject",
      "这是上限、不是目标：常驻包实际多大由记忆库和各项配额决定（本机实测最厚约 900 tok）。"
      "调大不会多花一分钱，只是给记忆增长留余量；调到低于实际体积就会触发裁剪，"
@@ -386,6 +403,16 @@ CFG_ITEMS = [
     # ---- 用量 ----
     ("token_stats_enabled", "记录 Token 用量", "bool", "usage",
      "记录对话、总结、注入各花了多少 token。关掉之后面板「Token 用量」就没有数据"),
+    ("cache_expire_gap_seconds", "自然过期阈值（秒）", "int", "usage",
+     "距上一轮超过这个秒数，就认定 provider 前缀缓存已自然过期：该轮 0% 单独打标「自然过期」，"
+     "并从「有效命中率」里剔除。只改统计归类，不动任何 prompt、不触发记忆包重建。"
+     "默认 180（实测 GLM 缓存约 2~3 分钟过期）；想恢复旧口径填 600；填大值等于基本不剔除。"
+     "有效范围 30~3600，超范围自动回落到 180"),
+    ("hit_baseline_since", "命中率基线分界时间", "str", "usage",
+     "这个时刻之前的所有缓存命中率数据，都归进「查看之前的缓存命中率」里单独看，"
+     "不再混进当前版本的统计。格式 YYYY-MM-DD HH:MM:SS（本机时间）。"
+     "默认 2026-11-08 19:15:00 = 本次缓存优化重载的时间点；留空＝不按时间切，"
+     "只按 dynamic 架构隔离旧版。改完重载一次生效"),
 
     # ---- 人际关系：关系网全部配置归这一组 ----
     ("inject_relations", "人际关系网总开关", "bool", "relation",
@@ -472,9 +499,13 @@ PROMPT_CFG_KEYS = (
 # 常驻包分片上限。每片存一份约 1KB 的完整块；真库目前 12 个 (人,会话)，
 # 长期运行还会随新会话累积。超了按最久未重建淘汰，别让 dict 无界增长。
 INJECT_CACHE_MAX = 64
-# 距上一轮超过这个秒数，provider 侧的前缀缓存基本已经过期（常见 TTL 5~10 分钟）。
+# 距上一轮超过这个秒数，provider 侧的前缀缓存基本已经过期。
 # 这类轮次 0% 是自然过期，不是插件把前缀弄坏了，统计上要单独剔除。
-CACHE_EXPIRE_GAP = 600
+# 2026-11-08 实测：GLM 前缀缓存 TTL 约 2~3 分钟，间隔 ≥3.3 分的轮次无一例外
+# cached=0，而紧接着的下一轮立刻 97~99%；旧值 600 太宽，把正常过期混进了
+# 「有效命中率」，数字被无端拉低。这里只作代码兜底，实际值读
+# usage.cache_expire_gap_seconds（WebUI「用量」组可配，改它不影响 prompt）。
+CACHE_EXPIRE_GAP = 180
 # 冷启动 / 重载归因：内存里的冻结块一重载就没了，但字节可能一个没变。
 COLD_REASONS = ("cold", "reload")
 
@@ -569,6 +600,7 @@ CFG_DEFAULTS = {
     "outbound_cause_window": 180,
     "record_outbound_other": True,
     "outbound_dedup_seconds": 120,
+    "outbound_bridge_token": "",
     "bot_isolation": True,
     "inject_relations": False, "inject_relation_limit": 6,
     "alias_cleanup_enabled": True,
@@ -582,6 +614,8 @@ CFG_DEFAULTS = {
     "inject_cross_include_self": False,
     "inject_mode": "frozen",
     "inject_dedup": True,
+    "inject_freeze_min_seconds": 180,
+    "inject_freeze_max_rounds": 0,
     "inject_budget_tokens": 1200, "pack_l3_snippets": 0, "pack_l2_limit": 12,
     "inject_l2_resident_limit": 0,
     "pack_l2_keep_min": 3, "pack_l3_keep_min": 0, "pack_l2_rel_ratio": 30,
@@ -602,6 +636,8 @@ CFG_DEFAULTS = {
     "affinity_enabled": True, "affinity_cap": 1000,
     "summary_circuit_threshold": 3, "summary_circuit_cooldown": 600,
     "affinity_tone": True, "token_stats_enabled": True,
+    "cache_expire_gap_seconds": 180,  # = CACHE_EXPIRE_GAP，写字面量以便 gen_schema.py 用 ast.literal_eval 解析
+    "hit_baseline_since": "2026-11-08 19:15:00",
     "tool_relation_write": False, "tool_relation_query": False,
     "tool_memory_search": True, "tool_outbound_history": True,
     "tool_relation_write_admin_only": False,
@@ -987,6 +1023,9 @@ class SugarMemory(Star):
         self._pending: set[str] = set()
         self._idle_tasks: dict[str, asyncio.Task] = {}
         self._pending_since: dict[str, float] = {}
+        # 本轮请求有没有带图片：session -> (记录时刻, 是否带图)。
+        # on_llm_response 阶段不一定还能拿到原始消息组件，故在 on_llm_request 阶段先钉住。
+        self._img_flag: dict[str, tuple[float, bool]] = {}
         self._summary_fail_at: dict[str, float] = {}
         self._summary_lock = asyncio.Lock()
         self._summarizing = False
@@ -1029,10 +1068,72 @@ class SugarMemory(Star):
         # cached_tokens 时一并落库。按 session_id 索引，只留最近若干条。
         # 没有它，cached 就无法归因到「同 fp 连续轮 / 重建轮」。
         self._last_inject_state: dict[str, dict] = {}
+        self._data_dir = plugin_data
+        self._write_bridge_token()
         logger.info(f"[SugarMemory] M1 已加载，数据目录：{plugin_data}")
         self._register_web()
         self._apply_tool_flags()
         self._hook_context_send()
+
+    def _write_bridge_token(self) -> None:
+        # 把联动凭证写到共享数据目录，供其他插件读取后给主动消息打标。
+        # 只写自己 data 目录，不碰别的插件文件；凭证留空就写 enabled=false。
+        try:
+            import json as _json
+            token = str(self._cfg("outbound_bridge_token", "") or "").strip()
+            path = os.path.join(self._data_dir, "outbound_bridge.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                _json.dump({
+                    "token": token, "enabled": bool(token),
+                    "attr": "_sugarmemory_bridge",
+                    "usage": "发送前挂 message_chain._sugarmemory_bridge = "
+                             "{'token': <token>, 'label': ..., 'cause': ...}",
+                }, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.debug("[SugarMemory] 写联动凭证失败", exc_info=True)
+
+    def _baseline_ts(self) -> float:
+        # 「之前的缓存命中率」的时间分界。留空 = 只按 dynamic 隔离旧版。
+        raw = str(self._cfg("hit_baseline_since", "") or "").strip()
+        if not raw:
+            return 0.0
+        try:
+            from datetime import datetime as _dt
+            return float(_dt.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp())
+        except Exception:
+            logger.debug("[SugarMemory] 基线时间格式不对：%s", raw)
+            return 0.0
+
+    @staticmethod
+    def _event_has_image(event) -> bool:
+        # 本轮用户消息里有没有图片。图片 URL/内容每轮不同，会让前缀缓存
+        # 从历史那一截开始失效，逐轮明细里单独标出来便于对账。
+        try:
+            msg_obj = getattr(event, "message_obj", None)
+
+            # AstrBotMessage.message 本身就是组件列表（list[BaseMessageComponent]），
+            # 并没有 .chain 属性。早期写成 message.chain 会永远拿到空列表 → 图片全漏标。
+            # 这里同时兼容列表、带 chain 的包装对象、以及 dict 形式的组件（不同适配器）。
+            raw = getattr(msg_obj, "message", None)
+            chain = raw if isinstance(raw, (list, tuple)) else (getattr(raw, "chain", None) or [])
+            for c in chain:
+                if isinstance(c, dict):
+                    ct = str(c.get("type") or "").lower()
+                    if "image" in ct or ct in ("photo", "picture", "img"):
+                        return True
+                    continue
+                name = type(c).__name__.lower()
+                if "image" in name or name in ("photo", "picture", "img"):
+                    return True
+
+            # 兜底：部分适配器把图片降级成纯文本标记（[图片] / [CQ:image] / <image>），
+            # event.message_str 与 message_obj.message_str 都可能带，拼起来一起看。
+            text = (str(getattr(event, "message_str", "") or "") + " "
+                    + str(getattr(msg_obj, "message_str", "") or "")).lower()
+            return ("[图片" in text or "[cq:image" in text or "[image" in text
+                    or "<image" in text or "![image" in text)
+        except Exception:
+            return False
 
     def _cfg(self, key, default):
         """读配置。真值在分组里（schema 用了 object 嵌套），但老用户的扁平配置也要认。
@@ -1517,7 +1618,8 @@ class SugarMemory(Star):
 
     def _record_tokens(self, module: str, *, usage=None, input: int = 0, cached: int = 0,
                        output: int = 0, source: str = "actual", subject: str = "",
-                       session_id: str = "", provider_id: str = ""):
+                       session_id: str = "", provider_id: str = "",
+                       has_image: int = 0):
         """usage 有就用 provider 报的真实值，没有就用传进来的估算值。全 0 不记。
 
         module='chat' 时自动把本轮 system 前缀的状态（哪份 fp、是否刚重建、
@@ -1548,6 +1650,7 @@ class SugarMemory(Star):
                     # 常驻底档自己的指纹：面板判「冻结生效没」用它，
                     # 整块 fp 换个话题就会变，拿它当故障指标会天天报警。
                     "prefix_sig": str(st.get("prefix_sig") or ""),
+                    "has_image": 1 if has_image else 0,
                 }
                 # 重载 / 重启后内存缓存被清空，下一轮必然写一次新缓存。
                 # 在日志里明说这是固定正常，别让用户（和以后的我）拿它当故障查。
@@ -1567,10 +1670,16 @@ class SugarMemory(Star):
     async def record_llm_tokens(self, event: AstrMessageEvent, response):
         """对话本身一轮的真实用量（provider 没报 usage 就不记，不瞎估）。"""
         try:
+            sess = self._session_key(event)
+            # 现场判一次，再用请求阶段钉下的标记兜底（5 分钟内有效，防跨轮粘标）。
+            flag_ts, flag = self._img_flag.get(sess, (0.0, False))
+            has_img = self._event_has_image(event) or (
+                flag and (time.time() - flag_ts) <= 300)
             self._record_tokens("chat", usage=getattr(response, "usage", None),
                                 subject=self._sender_name(event),
-                                session_id=self._session_key(event),
-                                provider_id=self._provider_label(event, response))
+                                session_id=sess,
+                                provider_id=self._provider_label(event, response),
+                                has_image=1 if has_img else 0)
         except Exception:
             logger.debug("[SugarMemory] 对话用量记录失败", exc_info=True)
 
@@ -1981,6 +2090,13 @@ class SugarMemory(Star):
 
     @filter.on_llm_request()
     async def inject_memory(self, event: AstrMessageEvent, req: ProviderRequest):
+        # 先把「本轮带不带图片」钉在请求阶段：到了 on_llm_response，event 里的
+        # 原始消息组件有可能已经被改写/清空，那时候再判会漏。
+        try:
+            self._img_flag[self._session_key(event)] = (
+                time.time(), self._event_has_image(event))
+        except Exception:
+            pass
         try:
             # 存量旧事实还没有问法别名：第一次有人说话时后台补齐（只踢一次）
             if not self._alias_kicked and self._cfg("alias_autogen", True):
@@ -2224,8 +2340,20 @@ class SugarMemory(Star):
         # l2_sig 只认常驻底档，绝不把本轮话题增量算进去——否则话题结束切回
         # 纯常驻包时会被误判成「用户刚改了记忆」，立刻重建、缓存白费。
         base_l2 = list(pack.get("l2") or [])
+        # 前缀指纹必须覆盖 build_block._l2_line 真正渲染进 system 的每个字段。
+        # 旧版只算 id:value，confidence / created_at / 出处 / 称呼 / predicate
+        # 任一变化都不会反映到面板的「前缀一致」上，于是出现面板报前缀一致、
+        # provider 却 cached=0 的假象。此处只影响归因，不改任何注入内容。
         l2_sig = hashlib.sha256("|".join(
-            f"{r.get('id')}:{r.get('value')}" for r in base_l2
+            ":".join((
+                str(r.get("id") or ""),
+                str(r.get("value") or ""),
+                str(r.get("predicate") or ""),
+                f"{float(r.get('confidence') or 0):.2f}",
+                str(r.get("source_msg_id") or ""),
+                str(r.get("created_at") or ""),
+                str(r.get("_shown") or ""),
+            )) for r in base_l2
         ).encode("utf-8")).hexdigest()[:16]
 
         # ---- B 方案（volatile-tail 变体，0.16.8）------------------------
@@ -2415,12 +2543,55 @@ class SugarMemory(Star):
                 return (ent["block"], ent["pack_tokens"], ent["rel_tokens"],
                         _meta(str(ent["fp"]), False, used_rounds, "same_fp",
                               prefix=ent.get("l2_sig")))
+            # 2026-11-08 缓存排查：fp 变了不等于「整段前缀废了」，得先看清是
+            # 哪一段第一个分叉。只打首个差异行 + 它所属的段落标记，不落整块。
+            # 观察用的诊断，不参与判定、不改注入内容；定位完成后可随时删掉。
+            _old_lines = str(ent.get("block") or "").splitlines()
+            _new_lines = candidate.splitlines()
+            _first = next(
+                (k for k, (a, b) in enumerate(zip(_old_lines, _new_lines)) if a != b),
+                min(len(_old_lines), len(_new_lines)),
+            )
+            _seg = next(
+                (ln for ln in reversed(_new_lines[:_first + 1]) if ln.startswith("- [")),
+                "(块首/无段落标记)",
+            )
+            logger.info(
+                f"[SugarMemory][fp-diff] {who}|{sess} 行{_first} "
+                f"({len(_old_lines)}→{len(_new_lines)}) 段={_seg[:40]} "
+                f"旧={(_old_lines[_first] if _first < len(_old_lines) else '<无>')[:90]!r} "
+                f"新={(_new_lines[_first] if _first < len(_new_lines) else '<无>')[:90]!r}"
+            )
             # fp 变了 = 内容确实变了 → 重建。0.16.15 起这里不再判时间/轮数：
             # B 方案的召回是纯追加在整块最末尾，prefix 段（前 prefix_n 条 L2 +
             # 关系快照前段）一个字节都不动，重建只重算尾部几条，硬等 180 秒
             # 对缓存没有收益，只会让新记下的东西迟到。「L2 底档本身变了」单独
             # 归因（l2_changed），其余统称 fp_changed。
             reason = ("l2_changed" if l2_sig != ent.get("l2_sig") else "fp_changed")
+
+        # ---- 可选节流：由设置项 inject_freeze_min_seconds 控制（可关）--------
+        # 0.16.15 起判据只有「fp 变即重建」。实盘里跨会话近况、门控筛除条数、
+        # 话题尾部这些流水段几乎每轮都在变（见 [fp-diff] 日志），fp 恒变 →
+        # 整块 system 加后面整段历史全部作废，命中率只剩开头 6~8k。这里把旧
+        # A 方案的最小复用窗口做成可关的开关，原判据一行没删：
+        #   · 设为 0 = 完全走 0.16.15 起的原逻辑（fp 变即重建，机动性最高）；
+        #   · 开启后只压 fp_changed（流水段变化），复用上一轮真正挂出去的块；
+        #   · l2_changed / config / cold / dedup_off 一律立即重建，保证新事实、
+        #     改配置、插件重载不迟到；
+        #   · 检索/召回照跑，统计轨与话题信号不受影响，只是不马上写进 prompt。
+        min_sec = _int_cfg("inject_freeze_min_seconds", 0)
+        max_rounds = _int_cfg("inject_freeze_max_rounds", 0)
+        if (min_sec > 0 or max_rounds > 0) and reason == "fp_changed" and ent:
+            age = now - float(ent.get("built_at") or 0)
+            time_ok = min_sec <= 0 or age < min_sec
+            round_ok = max_rounds <= 0 or used_rounds < max_rounds
+            if time_ok and round_ok:
+                # built_at / fp / block 全不动：面板上「已冻结多久」和
+                # provider 实际看到的前缀才对得上。pending_fp 只作诊断。
+                ent["pending_fp"] = fp
+                return (ent["block"], ent["pack_tokens"], ent["rel_tokens"],
+                        _meta(str(ent["fp"]), False, used_rounds, "throttled",
+                              prefix=ent.get("l2_sig")))
 
         unchanged = False
         if reason == "cold":
@@ -2707,6 +2878,15 @@ class SugarMemory(Star):
                 result = await orig(session, message_chain)
                 try:
                     tag = getattr(message_chain, "_sugarmemory_relay", None)
+                    bridge = getattr(message_chain, "_sugarmemory_bridge", None)
+                    if not isinstance(tag, dict) and isinstance(bridge, dict):
+                        want = str(plugin._cfg("outbound_bridge_token", "") or "").strip()
+                        if want and str(bridge.get("token") or "") == want:
+                            # 凭证对上 = 这是别的插件替 AI 主动发的，不是当前对话
+                            # 的分段回声。按「转述级」放行，跳过 120s 回声去重。
+                            tag = {"cause": str(bridge.get("cause") or ""),
+                                   "label": str(bridge.get("label") or ""),
+                                   "_bridge": True}
                     plugin._record_outbound(
                         session, message_chain, ok=result is not False, tag=tag
                     )
@@ -2832,7 +3012,9 @@ class SugarMemory(Star):
                 # label 允许发送方自定义这句记录的开头（定时任务插件用它记成
                 # 「你按定时任务「早安」发给群 xxx」，跟真转述区分开）。不填照旧。
                 label = (str(tag.get("label") or "").strip()
-                         or f"你转述给{self._session_label(sess)}")
+                         or (f"你主动发给{self._session_label(sess)}"
+                             if tag.get("_bridge") else
+                             f"你转述给{self._session_label(sess)}"))
             else:
                 window = max(0, int(self._cfg("outbound_cause_window", 180) or 0))
                 cause = self._outbound_cause(sess, window, bot_id=bot) if window else ""
@@ -3316,6 +3498,7 @@ class SugarMemory(Star):
         except Exception:
             return
         register(f"{PANEL_PREFIX}", self._panel_page, ["GET"], "记忆中枢面板")
+        register(f"{PANEL_PREFIX}/img/<path:name>", self._panel_asset, ["GET"], "面板图片资源")
         register(f"{API_PREFIX}/overview", self._api_overview, ["GET"], "总览")
         register(f"{API_PREFIX}/subjects", self._api_subjects, ["GET"], "用户列表")
         register(f"{API_PREFIX}/user", self._api_user, ["GET"], "单个用户的记忆")
@@ -3385,6 +3568,18 @@ class SugarMemory(Star):
     async def _panel_page(self):
         page = Path(__file__).parent / "pages" / "记忆中枢" / "index.html"
         return await send_file(str(page))
+
+    async def _panel_asset(self, name: str = ""):
+        """面板的图片资源。只认 pages/记忆中枢/img/ 下面，且不许用 .. 跳出去。"""
+        base = (Path(__file__).parent / "pages" / "记忆中枢" / "img").resolve()
+        try:
+            target = (base / str(name or "")).resolve()
+            target.relative_to(base)
+        except (ValueError, OSError):
+            return Response("not found", status=404)
+        if not target.is_file():
+            return Response("not found", status=404)
+        return await send_file(str(target))
 
     def _ok(self, data=None) -> dict:
         return {"status": "ok", "data": data or {}}
@@ -4797,6 +4992,9 @@ class SugarMemory(Star):
             "audit": audit_rows,
         }
         return self._ok({
+            # 判定是这次请求现算的；带上时间，面板上就能一眼确认「这份体检是不是刚读的」。
+            "read_at": time.strftime("%H:%M:%S"),
+            "read_ts": int(time.time()),
             "framework": {
                 "ok": bool(raw), "source": source, "source_detail": detail,
                 "runner_type": runner, "compression_supported": supported,
@@ -5730,6 +5928,9 @@ class SugarMemory(Star):
         if self._cfg_fp() != fp_before:
             self._invalidate_cache_for_config()
         self._apply_tool_flags()
+        # 凭证改了立刻刷新共享文件，对方插件不用等重载就能读到新暗号。
+        if "outbound_bridge_token" in patch:
+            self._write_bridge_token()
         return self._ok({
             "saved": True, "mode": info,
             "items": self._cfg_items(), "path": self._cfg_path or "",
@@ -5841,6 +6042,8 @@ class SugarMemory(Star):
             session = (q.get("session") or "").strip()
             limit = max(1, min(500, int(q.get("limit") or 100)))
             offset = max(0, int(q.get("offset") or 0))
+            legacy = (q.get("legacy") or "").strip().lower() in ("1", "true", "yes")
+            baseline_ts = self._baseline_ts()
 
             now = time.time()
             span = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}.get(rng, 0)
@@ -5859,8 +6062,18 @@ class SugarMemory(Star):
                 return normalize_provider_label(_provider_raw(r))
 
             plow, slow = provider.lower(), session.lower()
+
+            def _in_scope(r):
+                ts = float(r.get("ts") or 0)
+                if legacy:
+                    # 「之前的缓存命中率」= 旧版 dynamic 全量 + 基线时刻前的全部数据
+                    return (baseline_ts > 0 and ts < baseline_ts) or _arch(r) == "dynamic"
+                if baseline_ts > 0 and ts < baseline_ts:
+                    return False
+                return arch in ("", "all") or _arch(r) == arch
+
             rows = [r for r in all_rows
-                    if (arch in ("", "all") or _arch(r) == arch)
+                    if _in_scope(r)
                     and (not plow or plow in _provider(r).lower()
                          or plow in _provider_raw(r).lower())
                     and (not slow or slow in str(r.get("session_id") or "").lower()
@@ -5913,6 +6126,26 @@ class SugarMemory(Star):
             by_fp = _group(
                 [r for r in frozen if r.get("prefix_sig") or r.get("inject_fp")],
                 lambda r: str(r.get("prefix_sig") or r.get("inject_fp") or "")[:12])
+            # 折叠长条展开后要看这个 fp 下真实跑过哪几轮，不能只给一个汇总数。
+            fp_buckets: dict[str, list] = {}
+            for r in frozen:
+                k = str(r.get("prefix_sig") or r.get("inject_fp") or "")[:12]
+                if k:
+                    fp_buckets.setdefault(k, []).append(r)
+            for d in by_fp:
+                grp = sorted(fp_buckets.get(d["key"], []),
+                             key=lambda x: float(x.get("ts") or 0), reverse=True)[:20]
+                d["recent"] = [{
+                    "ts": float(r.get("ts") or 0),
+                    "input": int(r.get("input") or 0),
+                    "cached": int(r.get("cached") or 0),
+                    "hit_rate": round(int(r.get("cached") or 0) /
+                                      max(1, int(r.get("input") or 0)
+                                          + int(r.get("cached") or 0)), 4),
+                    "rebuild_reason": str(r.get("rebuild_reason") or ""),
+                    "has_image": int(r.get("has_image") or 0),
+                    "freeze_rounds": int(r.get("freeze_rounds") or 0),
+                } for r in grp]
             by_reason = _group(
                 [r for r in frozen if str(r.get("rebuild_reason") or "")],
                 lambda r: str(r.get("rebuild_reason") or ""))
@@ -5923,7 +6156,15 @@ class SugarMemory(Star):
             #   first   新会话 / 首次记录，要先写一次缓存
             #   cold    插件重载把内存冻结块清空了，字节常常根本没变
             #   expired 隔太久，provider 侧前缀缓存已经自然过期
-            expire_gap = float(CACHE_EXPIRE_GAP)
+            # 阈值可在 WebUI「用量 → 自然过期阈值」调。它不在 PROMPT_CFG_KEYS 里，
+            # 改了只影响统计归类，不会让常驻记忆包重建。非法值一律回落默认。
+            try:
+                expire_gap = float(self._cfg(
+                    "cache_expire_gap_seconds", CACHE_EXPIRE_GAP))
+            except (TypeError, ValueError):
+                expire_gap = float(CACHE_EXPIRE_GAP)
+            if not (30.0 <= expire_gap <= 3600.0):
+                expire_gap = float(CACHE_EXPIRE_GAP)
             prev_by_key: dict[tuple, dict] = {}
             meta_by_id: dict[int, dict] = {}
             flag_labels = {
@@ -6033,6 +6274,7 @@ class SugarMemory(Star):
                     "pack_stable": m.get("pack_stable"),
                     "prefix_stable": m.get("prefix_stable"),
                     "prefix_sig": str(r.get("prefix_sig") or ""),
+                    "has_image": int(r.get("has_image") or 0),
                 })
 
             return self._ok({
@@ -6045,6 +6287,8 @@ class SugarMemory(Star):
                 "effective": effective,        # 剔除首轮/冷启动/自然过期后
                 "flags": flags, "by_flag": by_flag, "by_reason": by_reason,
                 "expire_gap_seconds": int(expire_gap),
+                "baseline_ts": baseline_ts, "legacy": legacy,
+                "baseline_since": str(self._cfg("hit_baseline_since", "") or ""),
                 "by_arch": by_arch, "by_provider": by_provider,
                 "by_session": by_session, "by_state": by_state, "by_fp": by_fp,
                 "frozen_calls": len(frozen),
@@ -6063,6 +6307,7 @@ class SugarMemory(Star):
                     "pack_l2_limit": _int_cfg("pack_l2_limit", 12),
                     "token_stats_enabled": bool(self._cfg("token_stats_enabled", True)),
                     "cache_expire_gap_seconds": int(expire_gap),
+                    "hit_baseline_since": str(self._cfg("hit_baseline_since", "") or "") or "未设置",
                 },
                 "notes": [
                     "【两个指标，优先看常驻前缀命中率】它 = 常驻底档（prefix 那几条 L2）的指纹与同会话上一轮一致的比例，只衡量插件自己挂进 system 的那块有没有变；frozen 架构下它接近 100% 才说明冻结生效。整块 fp 还含本轮话题尾部，换个话题就会变，拿它判漂移会把正常的话题刷新全算成故障（2026-11-08 起分开记 prefix_sig）。",
