@@ -413,6 +413,11 @@ CFG_ITEMS = [
      "不再混进当前版本的统计。格式 YYYY-MM-DD HH:MM:SS（本机时间）。"
      "默认 2026-11-08 19:15:00 = 本次缓存优化重载的时间点；留空＝不按时间切，"
      "只按 dynamic 架构隔离旧版。改完重载一次生效"),
+    ("hit_exclude_system_changed", "剔除 system 变化轮", "bool", "usage",
+     "重载后每轮会定格整条 req.system_prompt 的哈希与首个差异行（日志打 [SugarMemory][sys-diff]）。"
+     "整条 system 变一个字，provider 从第一个 64-token 块起就全不命中，后面几十 k 全废，"
+     "这种 0% 不是记忆包漂移。开（默认）＝单独打标「system 变化」并从「有效命中率」剔除；"
+     "关＝只在明细里打标、照常计入统计。只改统计归类，不动任何 prompt、不触发记忆包重建"),
 
     # ---- 人际关系：关系网全部配置归这一组 ----
     ("inject_relations", "人际关系网总开关", "bool", "relation",
@@ -499,6 +504,9 @@ PROMPT_CFG_KEYS = (
 # 常驻包分片上限。每片存一份约 1KB 的完整块；真库目前 12 个 (人,会话)，
 # 长期运行还会随新会话累积。超了按最久未重建淘汰，别让 dict 无界增长。
 INJECT_CACHE_MAX = 64
+# 整条 system_prompt 观测：每会话只留上一轮的行列表，长跑时按同样规模淘汰，
+# 别让「为了查前缀」这件事本身变成内存泄漏。
+SYS_PROBE_MAX = 64
 # 距上一轮超过这个秒数，provider 侧的前缀缓存基本已经过期。
 # 这类轮次 0% 是自然过期，不是插件把前缀弄坏了，统计上要单独剔除。
 # 2026-11-08 实测：GLM 前缀缓存 TTL 约 2~3 分钟，间隔 ≥3.3 分的轮次无一例外
@@ -638,6 +646,7 @@ CFG_DEFAULTS = {
     "affinity_tone": True, "token_stats_enabled": True,
     "cache_expire_gap_seconds": 180,  # = CACHE_EXPIRE_GAP，写字面量以便 gen_schema.py 用 ast.literal_eval 解析
     "hit_baseline_since": "2026-11-08 19:15:00",
+    "hit_exclude_system_changed": True,
     "tool_relation_write": False, "tool_relation_query": False,
     "tool_memory_search": True, "tool_outbound_history": True,
     "tool_relation_write_admin_only": False,
@@ -1026,6 +1035,14 @@ class SugarMemory(Star):
         # 本轮请求有没有带图片：session -> (记录时刻, 是否带图)。
         # on_llm_response 阶段不一定还能拿到原始消息组件，故在 on_llm_request 阶段先钉住。
         self._img_flag: dict[str, tuple[float, bool]] = {}
+        # 整条 system_prompt 的前缀观测（2026-11-09）：
+        # _req_probe 只存请求对象引用，等 on_llm_response 时再定格最终值——
+        # on_llm_request 各插件的执行顺序不由本插件决定，注入当时读到的
+        # system_prompt 可能还没被排在后面的插件（表情协议 / 时间提醒等）改完。
+        # 响应阶段所有钩子都跑完了，这时读到的才是真正发给 provider 的那份。
+        self._req_probe: dict[str, tuple[float, object]] = {}
+        # session -> 上一轮 (短哈希, 行列表, 字符数)
+        self._sys_prev: dict[str, tuple[str, list[str], int]] = {}
         self._summary_fail_at: dict[str, float] = {}
         self._summary_lock = asyncio.Lock()
         self._summarizing = False
@@ -1134,6 +1151,69 @@ class SugarMemory(Star):
                     or "<image" in text or "![image" in text)
         except Exception:
             return False
+
+    # ---------- 整条 system_prompt 的前缀观测 ----------
+
+    @staticmethod
+    def _first_sys_diff(prev, cur) -> str:
+        """两份 system_prompt 的首个差异行摘要。只留行号 + 每段 90 字：
+        够定位是哪一段在变，又不把整段 prompt（可能含记忆正文）抄进库和日志。"""
+        pl, cl = prev[1], cur[1]
+        head = "总长 %d→%d · 行数 %d→%d" % (prev[2], cur[2], len(pl), len(cl))
+        for i in range(max(len(pl), len(cl))):
+            a = pl[i] if i < len(pl) else None
+            b = cl[i] if i < len(cl) else None
+            if a == b:
+                continue
+
+            def clip(s):
+                if s is None:
+                    return "（无此行）"
+                s = " ".join(str(s).split())
+                return s[:90] + ("…" if len(s) > 90 else "")
+
+            return (head + " · 首个差异 L%d：旧=%s | 新=%s"
+                    % (i + 1, clip(a), clip(b)))
+        return head + " · 逐行相同（仅换行符或行尾差异）"
+
+    def _probe_final_system(self, sess: str) -> dict:
+        """响应阶段定格整条 req.system_prompt，和同会话上一轮比指纹 + 首个差异行。
+
+        GLM 从 system 的第一个 token 起按 64-token 块比对：前面改一个字，
+        后面几十 k 全废。所以「记忆包字节没变、整轮却 0%」时，该看的是这份
+        最终 system 有没有变，而不是只盯记忆包自己的 fp。
+        请求对象在 on_llm_request 里挂上引用，等所有钩子都跑完再来读，
+        避免被插件执行顺序坑到。返回的三项随本轮用量一起落库。
+        """
+        out = {"sys_fp": "", "sys_changed": 0, "sys_diff": ""}
+        ref = self._req_probe.pop(sess, None)
+        if not ref:
+            return out
+        ts, req = ref
+        if time.time() - ts > 900:   # 挂太久的引用不算本轮，别跨轮误判
+            return out
+        try:
+            text = str(getattr(req, "system_prompt", "") or "")
+        except Exception:
+            return out
+        lines = text.splitlines()
+        fp = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+        out["sys_fp"] = fp
+        prev = self._sys_prev.get(sess)
+        if prev is None:
+            out["sys_diff"] = "首轮基准：%d 字 / %d 行" % (len(text), len(lines))
+        elif prev[0] == fp:
+            pass
+        else:
+            out["sys_changed"] = 1
+            out["sys_diff"] = self._first_sys_diff(prev, (fp, lines, len(text)))
+            logger.info("[SugarMemory][sys-diff] sess=%s %s→%s %s",
+                        str(sess)[-24:], prev[0], fp, out["sys_diff"][:320])
+        self._sys_prev[sess] = (fp, lines, len(text))
+        if len(self._sys_prev) > SYS_PROBE_MAX:
+            for k in list(self._sys_prev)[:-SYS_PROBE_MAX]:
+                self._sys_prev.pop(k, None)
+        return out
 
     def _cfg(self, key, default):
         """读配置。真值在分组里（schema 用了 object 嵌套），但老用户的扁平配置也要认。
@@ -1619,7 +1699,8 @@ class SugarMemory(Star):
     def _record_tokens(self, module: str, *, usage=None, input: int = 0, cached: int = 0,
                        output: int = 0, source: str = "actual", subject: str = "",
                        session_id: str = "", provider_id: str = "",
-                       has_image: int = 0):
+                       has_image: int = 0, sys_fp: str = "", sys_changed: int = 0,
+                       sys_diff: str = ""):
         """usage 有就用 provider 报的真实值，没有就用传进来的估算值。全 0 不记。
 
         module='chat' 时自动把本轮 system 前缀的状态（哪份 fp、是否刚重建、
@@ -1651,6 +1732,11 @@ class SugarMemory(Star):
                     # 整块 fp 换个话题就会变，拿它当故障指标会天天报警。
                     "prefix_sig": str(st.get("prefix_sig") or ""),
                     "has_image": 1 if has_image else 0,
+                    # 整条 system_prompt 的最终指纹 / 是否较上轮变化 / 首个差异行。
+                    # 只有 chat 轮有值，老行迁移后是空串与 0，不会被误判成变化轮。
+                    "sys_fp": str(sys_fp or "")[:16],
+                    "sys_changed": 1 if sys_changed else 0,
+                    "sys_diff": str(sys_diff or "")[:300],
                 }
                 # 重载 / 重启后内存缓存被清空，下一轮必然写一次新缓存。
                 # 在日志里明说这是固定正常，别让用户（和以后的我）拿它当故障查。
@@ -1675,11 +1761,14 @@ class SugarMemory(Star):
             flag_ts, flag = self._img_flag.get(sess, (0.0, False))
             has_img = self._event_has_image(event) or (
                 flag and (time.time() - flag_ts) <= 300)
+            # 所有 on_llm_request 钩子都跑完了，这时定格的 system_prompt 才是
+            # 真正发给 provider 的那份。指纹/差异随本轮账单一起落库。
+            probe = self._probe_final_system(sess)
             self._record_tokens("chat", usage=getattr(response, "usage", None),
                                 subject=self._sender_name(event),
                                 session_id=sess,
                                 provider_id=self._provider_label(event, response),
-                                has_image=1 if has_img else 0)
+                                has_image=1 if has_img else 0, **probe)
         except Exception:
             logger.debug("[SugarMemory] 对话用量记录失败", exc_info=True)
 
@@ -2095,6 +2184,15 @@ class SugarMemory(Star):
         try:
             self._img_flag[self._session_key(event)] = (
                 time.time(), self._event_has_image(event))
+        except Exception:
+            pass
+        # 留一份请求对象引用，响应阶段再定格最终 system_prompt。
+        # 不在这里直接读：别的插件可能排在本钩子之后才往 system 里写内容。
+        try:
+            self._req_probe[self._session_key(event)] = (time.time(), req)
+            if len(self._req_probe) > SYS_PROBE_MAX * 2:
+                for k in list(self._req_probe)[:-SYS_PROBE_MAX]:
+                    self._req_probe.pop(k, None)
         except Exception:
             pass
         try:
@@ -6027,8 +6125,9 @@ class SugarMemory(Star):
            cached / (input + cached)，包含框架 system、历史、工具 schema。
            前缀被框架改写时它会掉，但记忆包可能一个字节没变。
 
-        另外把首轮、重载冷启动、长间隔自然过期单独标记并从「有效命中率」
-        里剔除 —— 这三类 0% 都是固定正常，混进失败样本只会误导调参。
+        另外把首轮、重载冷启动、长间隔自然过期、整条 system_prompt 变化
+        单独标记并从「有效命中率」里剔除 —— 这四类 0% 都是固定正常，
+        混进失败样本只会误导调参。最后一类可用 usage.hit_exclude_system_changed 关剔除。
         只统计 module='chat' AND source='actual'：provider 上报的真实用量。
         工具循环里一次用户消息会打多次 LLM，这里只记对话轮，与主库
         provider_stats 的粒度不是 1:1。
@@ -6145,6 +6244,8 @@ class SugarMemory(Star):
                     "rebuild_reason": str(r.get("rebuild_reason") or ""),
                     "has_image": int(r.get("has_image") or 0),
                     "freeze_rounds": int(r.get("freeze_rounds") or 0),
+                    "sys_changed": int(r.get("sys_changed") or 0),
+                    "sys_diff": str(r.get("sys_diff") or ""),
                 } for r in grp]
             by_reason = _group(
                 [r for r in frozen if str(r.get("rebuild_reason") or "")],
@@ -6152,10 +6253,11 @@ class SugarMemory(Star):
 
             # ── 逐轮归因 ────────────────────────────────────────────────
             # 按 (会话, 架构) 时间正序走一遍，拿到上一轮的 fp 和距上轮间隔。
-            # 这三个标签的 0% 都是「本来就该 0%」，不该混进失败样本：
+            # 这四个标签的 0% 都是「本来就该 0%」，不该混进失败样本：
             #   first   新会话 / 首次记录，要先写一次缓存
             #   cold    插件重载把内存冻结块清空了，字节常常根本没变
             #   expired 隔太久，provider 侧前缀缓存已经自然过期
+            #   system  整条 system_prompt 和上一轮不同，第一个块起就全废
             # 阈值可在 WebUI「用量 → 自然过期阈值」调。它不在 PROMPT_CFG_KEYS 里，
             # 改了只影响统计归类，不会让常驻记忆包重建。非法值一律回落默认。
             try:
@@ -6165,11 +6267,14 @@ class SugarMemory(Star):
                 expire_gap = float(CACHE_EXPIRE_GAP)
             if not (30.0 <= expire_gap <= 3600.0):
                 expire_gap = float(CACHE_EXPIRE_GAP)
+            # 关掉后 system 变化轮只在明细打标、照常计入有效命中率。
+            exclude_sys = bool(self._cfg("hit_exclude_system_changed", True))
             prev_by_key: dict[tuple, dict] = {}
             meta_by_id: dict[int, dict] = {}
             flag_labels = {
                 "": "正常轮", "first": "首轮（写缓存）",
                 "cold": "重载冷启动", "expired": "自然过期",
+                "system": "system 变化",
             }
             for r in sorted(rows, key=lambda x: (
                     float(x.get("ts") or 0), int(x.get("id") or 0))):
@@ -6180,12 +6285,15 @@ class SugarMemory(Star):
                 cur_fp = str(r.get("inject_fp") or "")
                 reason = str(r.get("rebuild_reason") or "").strip().lower()
                 long_gap = gap is not None and gap >= expire_gap
+                sys_changed = bool(int(r.get("sys_changed") or 0))
                 if prev is None:
                     flag = "first"
                 elif reason in COLD_REASONS:
                     flag = "cold"
                 elif long_gap:
                     flag = "expired"
+                elif sys_changed and exclude_sys:
+                    flag = "system"
                 else:
                     flag = ""
                 # 一轮可能既是重载冷启动、又隔了很久。主标记只留一个（冷启动
@@ -6210,6 +6318,9 @@ class SugarMemory(Star):
                     "pack_stable": pack_stable, "prev_fp": prev_fp,
                     "prefix_stable": prefix_stable, "prefix_sig": cur_prefix,
                     "rebuild_reason": reason,
+                    "sys_changed": sys_changed,
+                    "sys_fp": str(r.get("sys_fp") or ""),
+                    "sys_diff": str(r.get("sys_diff") or ""),
                 }
                 prev_by_key[k] = r
 
@@ -6240,8 +6351,11 @@ class SugarMemory(Star):
             effective = _sum(effective_rows)
             effective["excluded"] = len(rows) - len(effective_rows)
             flags = {k: sum(1 for m in meta_by_id.values() if m["flag"] == k)
-                     for k in ("first", "cold", "expired", "")}
+                     for k in ("first", "cold", "expired", "system", "")}
             flags["long_gap"] = sum(1 for m in meta_by_id.values() if m["long_gap"])
+            # 不管剔除开关怎么设，面板都要能报出「总共有几轮 system 变了」
+            flags["sys_changed"] = sum(1 for m in meta_by_id.values()
+                                       if m.get("sys_changed"))
             by_flag = _group(
                 [r for r in rows
                  if meta_by_id.get(int(r.get("id") or 0), {}).get("flag")],
@@ -6275,6 +6389,9 @@ class SugarMemory(Star):
                     "prefix_stable": m.get("prefix_stable"),
                     "prefix_sig": str(r.get("prefix_sig") or ""),
                     "has_image": int(r.get("has_image") or 0),
+                    "sys_changed": int(bool(m.get("sys_changed"))),
+                    "sys_fp": str(m.get("sys_fp") or ""),
+                    "sys_diff": str(m.get("sys_diff") or ""),
                 })
 
             return self._ok({
@@ -6284,10 +6401,11 @@ class SugarMemory(Star):
                 "summary": _sum(rows),          # = 整轮请求命中率（兼容旧前端）
                 "request": _sum(rows),          # 同一份，语义更清楚
                 "pack": pack,                  # 记忆包命中率：优先看这个
-                "effective": effective,        # 剔除首轮/冷启动/自然过期后
+                "effective": effective,        # 剔除首轮/冷启动/自然过期/system 变化后
                 "flags": flags, "by_flag": by_flag, "by_reason": by_reason,
                 "expire_gap_seconds": int(expire_gap),
                 "baseline_ts": baseline_ts, "legacy": legacy,
+                "exclude_system_changed": exclude_sys,
                 "baseline_since": str(self._cfg("hit_baseline_since", "") or ""),
                 "by_arch": by_arch, "by_provider": by_provider,
                 "by_session": by_session, "by_state": by_state, "by_fp": by_fp,
@@ -6308,12 +6426,14 @@ class SugarMemory(Star):
                     "token_stats_enabled": bool(self._cfg("token_stats_enabled", True)),
                     "cache_expire_gap_seconds": int(expire_gap),
                     "hit_baseline_since": str(self._cfg("hit_baseline_since", "") or "") or "未设置",
+                    "hit_exclude_system_changed": exclude_sys,
                 },
                 "notes": [
                     "【两个指标，优先看常驻前缀命中率】它 = 常驻底档（prefix 那几条 L2）的指纹与同会话上一轮一致的比例，只衡量插件自己挂进 system 的那块有没有变；frozen 架构下它接近 100% 才说明冻结生效。整块 fp 还含本轮话题尾部，换个话题就会变，拿它判漂移会把正常的话题刷新全算成故障（2026-11-08 起分开记 prefix_sig）。",
                     "整轮请求命中率 = 缓存输入 / (普通输入 + 缓存输入)，只统计 provider 上报真实用量的对话轮（chat / actual）；注入块、工具结果那些按文本估的行不算，否则会算低。",
                     "cached_tokens 是整轮请求的前缀缓存，包含框架 system_prompt、历史消息、工具 schema。所以整轮命中率低 ≠ 记忆包失效：包字节没变时，miss 出在框架历史裁剪 / 工具集变化 / provider 缓存 TTL 这些外层。",
-                    f"【0% 有三种是固定正常】首轮要先写一次缓存；插件重载 / 重启会清空内存里的冻结块（日志会提示「重载冷启动」，字节往往一个没变）；距上轮间隔超过 {int(expire_gap)} 秒时 provider 缓存已自然过期。这三类都单独打标，不算失败样本，「有效命中率」也把它们剔除了。",
+                    f"【0% 有四种是固定正常】首轮要先写一次缓存；插件重载 / 重启会清空内存里的冻结块（日志会提示「重载冷启动」，字节往往一个没变）；距上轮间隔超过 {int(expire_gap)} 秒时 provider 缓存已自然过期；整条 system_prompt 相比上一轮变了（见下条）。这四类都单独打标，不算失败样本，「有效命中率」也把它们剔除了。",
+                    "【第四类：整条 system 变化】重载后每轮会在响应阶段定格整条 req.system_prompt 的 sha256 短哈希（sys_fp）与首个差异行（sys_diff，日志 [SugarMemory][sys-diff]）。GLM 从 system 第一个 token 起按 64-token 块比对，前面改一个字、后面几十 k 全废，所以「常驻前缀一致却整轮 0%」多半是外层 system 在变，不是记忆包漂移。看日志里的 L 行号和行数/总长变化，就能定位是哪段文案在动。这类轮次" + ("已从「有效命中率」剔除；想照常计入，去「用量 → 剔除 system 变化轮」关掉。" if exclude_sys else "当前只打标、未从「有效命中率」剔除（用量 → 剔除 system 变化轮 可开）。"),
                     "cached = 0 还可能是这个 provider 没把命中数上报（部分框架只认 OpenAI 格式的 prompt_tokens_details.cached_tokens）。别把零命中一律当成缓存失效。",
                     "工具循环里一次用户消息会打多次 LLM，插件只记「对话轮」，与主库 provider_stats 的请求级记录不是 1:1，跨表对比前先对齐口径。",
                     "arch_ver=frozen / dynamic 才能做 A/B；旧数据在加字段时已统一锁成 dynamic，作为改造前的 baseline。「按重建原因」能看出 cold/reload、config、l2_changed、fp_changed 各占多少，比只看 rebuilt=1 准。",

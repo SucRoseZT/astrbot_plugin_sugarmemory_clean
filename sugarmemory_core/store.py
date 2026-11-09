@@ -416,7 +416,13 @@ CREATE TABLE IF NOT EXISTS token_usage (
   -- 2026-11-08：常驻底档（prefix 那 12 条 L2）自己的指纹，与整块 inject_fp 分开记。
   -- inject_fp 含本轮话题尾部，换个话题就变；用它判「漂移」会把正常的话题刷新
   -- 全算成故障。真正该盯的是这一列：它一变才说明常驻前缀被改写了。
-  prefix_sig TEXT NOT NULL DEFAULT ''
+  prefix_sig TEXT NOT NULL DEFAULT '',
+  -- 2026-11-09：整条 system_prompt 的最终观测。记忆包字节没变但整轮 0% 时，
+  -- 要看的是 system 第一个字节起有没有变；sys_diff 存首个差异行摘要，
+  -- 只截断存 90 字，不把整段 prompt 抄进来。
+  sys_fp TEXT NOT NULL DEFAULT '',
+  sys_changed INTEGER NOT NULL DEFAULT 0,
+  sys_diff TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tok_ts ON token_usage(ts);
 CREATE INDEX IF NOT EXISTS idx_tok_mod ON token_usage(module, ts);
@@ -906,6 +912,9 @@ class SugarStore:
             ("rebuild_reason", "TEXT NOT NULL DEFAULT ''"),
             ("prefix_sig", "TEXT NOT NULL DEFAULT ''"),
             ("has_image", "INTEGER NOT NULL DEFAULT 0"),
+            ("sys_fp", "TEXT NOT NULL DEFAULT ''"),
+            ("sys_changed", "INTEGER NOT NULL DEFAULT 0"),
+            ("sys_diff", "TEXT NOT NULL DEFAULT ''"),
         ):
             if col not in tok_cols:
                 self._db.execute(f"ALTER TABLE token_usage ADD COLUMN {col} {ddl}")
@@ -3712,7 +3721,8 @@ class SugarStore:
                      ts: float | None = None, arch_ver: str = "", inject_fp: str = "",
                      rebuilt: int = 0, freeze_rounds: int = 0, cfg_ver: str = "",
                      rebuild_reason: str = "", prefix_sig: str = "",
-                     has_image: int = 0) -> int:
+                     has_image: int = 0, sys_fp: str = "", sys_changed: int = 0,
+                     sys_diff: str = "") -> int:
         """记一条用量。source=actual 是 provider 报的真实 usage，estimate 是我们估的。
 
         arch_ver/inject_fp/rebuilt/freeze_rounds/cfg_ver/rebuild_reason 只对
@@ -3729,14 +3739,17 @@ class SugarStore:
             cur = self._db.execute(
                 "INSERT INTO token_usage (ts, module, source, provider_id, subject, session_id,"
                 " input, cached, output, total, arch_ver, inject_fp, rebuilt, freeze_rounds,"
-                " cfg_ver, rebuild_reason, prefix_sig, has_image) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cfg_ver, rebuild_reason, prefix_sig, has_image, sys_fp, sys_changed, sys_diff)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (float(ts or time.time()), str(module or "other")[:32], str(source or "actual")[:16],
                  str(provider_id or "")[:64], str(subject or "")[:40], str(session_id or "")[:120],
                  int(input or 0), int(cached or 0), int(output or 0), max(0, total),
                  str(arch_ver or "")[:16], str(inject_fp or "")[:32],
                  1 if rebuilt else 0, max(0, int(freeze_rounds or 0)),
                  str(cfg_ver or "")[:32], str(rebuild_reason or "")[:24],
-                 str(prefix_sig or "")[:32], 1 if has_image else 0),
+                 str(prefix_sig or "")[:32], 1 if has_image else 0,
+                 str(sys_fp or "")[:16], 1 if sys_changed else 0,
+                 str(sys_diff or "")[:300]),
             )
             return int(cur.lastrowid)
 

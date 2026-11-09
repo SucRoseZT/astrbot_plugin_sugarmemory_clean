@@ -67,6 +67,11 @@ class FakeSelf:
     def __init__(self, store):
         self.store = store
         self.config = dict(CFG_DEFAULTS)
+        # 本文件测的是话题召回 / 前缀稳定性，不是注入节流。0.17.0 起节流键改叫
+        # inject_freeze_min_seconds（默认 180），而用例里只把 built_at 往前推
+        # 1 秒（旧版防抖窗口 TOPIC_MIN_INTERVAL 已移除），统一关掉，免得每个
+        # 场景都被判 throttled 而测不到真正的刷新逻辑。
+        self.config["inject_freeze_min_seconds"] = 0
         self._inject_cache = {}
 
     def _cfg(self, key, default):

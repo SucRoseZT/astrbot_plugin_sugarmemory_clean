@@ -21,6 +21,13 @@ BLOCK_HEADER = (
 )
 BLOCK_FOOTER = "</memory_context>"
 
+# 相关会话摘要的固定渲染上限（2026-11-10）。原来 trim_pack 按本轮包体积动态把
+# 摘要压到 75%，total(pack) 又随 outbound / cross / L3 浮动，同一份 171 字的
+# 摘要有时是全文、有时是 129 字带「…」，整条 system 前缀每轮跟着废。
+# 改成渲染时按固定字数截：只要库里那条 session_summary 没更新，这一行字节恒定。
+# 200 只给异常长摘要兜底（实测库内最长 171 字，日常根本不截）。
+SUMMARY_STABLE_CHARS = 200
+
 
 def _abs_when(ts_val: float) -> str:
     """绝对时间锚「·2026-10-28 06:35」。
@@ -207,6 +214,10 @@ def build_block(pack: dict) -> str:
     # pack._asks_about_message），隔三分钟问和隔三天问，同一句话同样触发。
     probe = bool(pack.get("probe_outbound"))
     probe_used = False
+    # 定时提醒段已挪到块中后段（见下面 _section 调用）。probe 说的是「下面第一条」，
+    # 必须跟着答案走：本轮有定时消息时只让定时段消费这条提示，别被块首的转述段
+    # 截胡，否则用户问「你刚才发我什么」时提示指向的是转述而不是定时消息。
+    _probe_cron = bool(probe and here_cron)
 
     # 实测翻车（2026-10-28 06:08）：06:08:00 定时发出去的消息就摆在段首，
     # 用户 06:08:14 回了个「啊？」，模型却顺着上一轮 05:40 查工具的结论答
@@ -217,16 +228,16 @@ def build_block(pack: dict) -> str:
     _probe_tail = "——用户此刻问的就是下面第一条，先承认你发过，再说清是哪条"
 
     def _section(rows: list[dict], header: str, here: bool,
-                 pinned_first: bool = False) -> None:
+                 pinned_first: bool = False, is_cron: bool = False) -> None:
         """渲染一节外发记录。header 自带方括号，是这节的一句话定义。"""
         nonlocal probe_used
         if not rows:
             return
-        # 定时任务/转述（pinned）排最前：它就是「你刚才定时发了什么」的答案本身
+        # pinned 记录排在「本节」最前（不是整块最前）：它就是答案本身
         if pinned_first:
             rows = sorted(rows, key=lambda e: not e.get("pinned"))
         lines.append(header)
-        if probe and not probe_used:
+        if probe and not probe_used and (not _probe_cron or is_cron):
             # 单独一行、紧贴下面那条记录：塞进 header 的方括号里会跟标题
             # 混成一句长话，模型反而分不清哪部分是说明、哪部分是内容。
             lines.append(f"  {_probe_tail}")
@@ -267,13 +278,13 @@ def build_block(pack: dict) -> str:
             c = _reorder_cause(c)
             lines.append(f"  · {c}")
 
-    # 当前会话的转述 / 定时消息，顶到块首、排在摘要和 L2 之前：这就是
-    # 「你刚才发了什么」的答案本身，模型开局就得看见。
-    # header 只留「类别 + 一句话定义」。早先每节都写三四句行为叮嘱
-    # （真事别否认／不是定时提醒／别再查 memory_search），实测模型并不需要：
-    # 标签本身说明白了是哪一类，它自然就不会混。字数省下来全给正文。
+    # 当前会话的转述留在块首：「你替人带了什么」的答案，模型开局就得看见。
+    # 定时提醒段不在这里（2026-11-10）：它随定时任务出现/消失，顶在块首会让
+    # 后面几十行整体后移，GLM 从第一个差异块起全不命中——实盘 83↔84 行
+    # 反复横跳、整轮 cached=0。挪到 L3 / 门控说明之后、话题增量 L2 之前：
+    # 在块中后段，又不在最末尾那片每轮都变的内容里。
+    # header 只留「类别 + 一句话定义」，标签本身足够说明这是哪一类。
     _section(here_relay, "- [转述｜你替人带给当前用户的话]", here=True, pinned_first=True)
-    _section(here_cron, "- [定时提醒｜你到点自动发给当前用户的话]", here=True, pinned_first=True)
     _section(here_other, "- [你发给当前用户的其他话]", here=True)
     # QQ 昵称和平时的叫法不是一个时的对照。瘦身（2026-11-06，与别名注入同一条
     # 规矩）：对照行只在「本轮 query 字面出现了这个 QQ 昵称」时才写——用户拿
@@ -289,6 +300,10 @@ def build_block(pack: dict) -> str:
     for _nk, _sh in _pairs_all.items():
         if _nk and _nk in _summary:
             _summary = _summary.replace(_nk, _sh)
+    # 固定上限渲染（2026-11-10）：绝不按本轮包体积动态压缩。库里那条摘要没变，
+    # 这一行的字节就必须逐轮相同；截断也走同一套规则，不给前缀缓存留抖动源。
+    if len(_summary) > SUMMARY_STABLE_CHARS:
+        _summary = _summary[:SUMMARY_STABLE_CHARS].rstrip("，。、；：…") + "…"
     if _summary:
         lines.append(f"相关会话摘要：{_summary}")
     def _l2_line(a: dict) -> str:
@@ -394,6 +409,11 @@ def build_block(pack: dict) -> str:
         lines.append(
             f"- [另有 {len(excluded)} 条被门控筛除（重复或临时状态，别提）：{reasons}]"
         )
+    # 定时提醒段从这里开始：前面所有常驻内容（转述/称呼/摘要/L2/跨会话/骨架/L3）
+    # 都不受它出现与否影响，它变了只废掉后面的话题增量尾巴。
+    # probe 的「下面第一条」也由这节认领（见 _probe_cron）。
+    _section(here_cron, "- [定时提醒｜你到点自动发给当前用户的话]",
+             here=True, pinned_first=True, is_cron=True)
     # 最后才写本轮话题召回的几条：它们是整块里唯一每轮都在变的部分，
     # 必须压在 BLOCK_FOOTER 前面，这样前面所有内容的位置都不受它们影响。
     _tail_rows = [a for a in (pack.get("l2") or []) if a.get("_topic_add")]
@@ -415,8 +435,11 @@ def trim_pack(pack: dict, budget_tokens: int,
       1. 此对话里的定时消息/时间/原因（outbound here，pinned）
       2. 跨会话记录（cross，尤其「关于我」的归因行）
       3. 与之相关的长期事实（L2）
-      4. 与之相关的摘要（summary）
+      4. 与之相关的摘要（summary）——2026-11-10 起不再让位，改为固定字数渲染
       5. L3 真实对话原文（最低）
+
+    摘要为什么不参与让位：它排在常驻前缀中段，压一次长度就变一次，后面
+    几十 k token 全废。宁可让 L3 / 骨架 / cross 多让一点，也不能让它抖。
 
     为什么 L3 排最后砍「也最该先让位」：astrbot 本身已按「压缩前最多保留
     对话轮数 = 15」把当前会话的原文留在上下文里，记忆包再带一遍 L3 是双花
@@ -451,15 +474,12 @@ def trim_pack(pack: dict, budget_tokens: int,
         dropped = pack["l3"].pop()
         notes.append(f"裁剪 L3 事件 1 条（{str(dropped.get('content', ''))[:20]}…）")
 
-    # 2) 压摘要。下限 60 字：低于这个长度摘要就只剩一句废话，不如直接砍掉。
-    #    每轮强制至少砍 10 字，否则 int(len*0.75) 在 80~106 区间可能原地踏步。
-    while total(pack) > budget_tokens and len(pack.get("summary") or "") > 60:
-        s = pack["summary"]
-        target = min(len(s) - 10, max(60, int(len(s) * 0.75)))
-        if target < 40:
-            break
-        pack["summary"] = s[:target].rstrip("，。、；：…") + "…"
-        notes.append(f"摘要压缩至 {len(pack['summary'])} 字")
+    # 2) 摘要不再在这里让位（2026-11-10）。原来按 total(pack) 动态压到 75%，
+    #    而 total 随本轮 outbound / cross / L3 浮动：同一份摘要有时全文、有时
+    #    129 字带「…」，整条 system 前缀每轮跟着废。现在摘要只在 build_block
+    #    里按固定字数渲染，trim_pack 一律不写 pack["summary"]。
+    #    超预算让位交给后面的 L3 / 骨架 / L2 / cross / 外发各步；宁可略微超一点
+    #    预算，也不让常驻前缀里出现一个会抖的行。
 
     # 3) 裁「发到其他会话、不带标签」的普通外发回声（分段回复/碎碎念，无信息量）。
     #    带标签的定时任务/转述（labeled）是「我在别的会话干过什么」的铁证，不在这裁。
@@ -540,13 +560,7 @@ def trim_pack(pack: dict, budget_tokens: int,
     while total(pack) > budget_tokens and pack.get("l3"):
         pack["l3"].pop()
         notes.append("突破保底：清空 L3")
-    while total(pack) > budget_tokens and len(pack.get("summary") or "") > 40:
-        s = pack["summary"]
-        target = min(len(s) - 10, max(40, int(len(s) * 0.7)))
-        if target < 20:
-            break
-        pack["summary"] = s[:target].rstrip("，。、；：…") + "…"
-        notes.append(f"摘要压缩至 {len(pack['summary'])} 字")
+    # 摘要不参与兜底压缩：理由同第 2 步，它是常驻前缀的一部分，压一次废一轮缓存。
 
     # 9) 最后才砍「你自己发过的话」，而且至少留 1 条。这段是全块里最贵的信任：
     #    砍干净了，AI 下一轮又会把真发过的转述当成幻觉去否认。

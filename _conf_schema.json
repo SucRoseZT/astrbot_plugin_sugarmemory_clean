@@ -530,6 +530,12 @@
         "type": "string",
         "hint": "这个时刻之前的所有缓存命中率数据，都归进「查看之前的缓存命中率」里单独看，不再混进当前版本的统计。格式 YYYY-MM-DD HH:MM:SS（本机时间）。默认 2026-11-08 19:15:00 = 本次缓存优化重载的时间点；留空＝不按时间切，只按 dynamic 架构隔离旧版。改完重载一次生效",
         "default": "2026-11-08 19:15:00"
+      },
+      "hit_exclude_system_changed": {
+        "description": "剔除 system 变化轮",
+        "type": "bool",
+        "hint": "重载后每轮会定格整条 req.system_prompt 的哈希与首个差异行（日志打 [SugarMemory][sys-diff]）。整条 system 变一个字，provider 从第一个 64-token 块起就全不命中，后面几十 k 全废，这种 0% 不是记忆包漂移。开（默认）＝单独打标「system 变化」并从「有效命中率」剔除；关＝只在明细里打标、照常计入统计。只改统计归类，不动任何 prompt、不触发记忆包重建",
+        "default": true
       }
     }
   },

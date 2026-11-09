@@ -256,6 +256,10 @@ def main():
         try:
             store2 = _fixture_db_multi(os.path.join(tmp2, "fx.db"))
             f2 = FakeSelf(store2)
+            # 0.17.0 起节流键改叫 inject_freeze_min_seconds（默认 180）。本用例
+            # 连着调两次 _frozen_block，不关就会被节流挡成 throttled，测不到
+            # 话题刷新本身。[3] 里那个 inject_freeze_seconds 是过时键名，不影响。
+            f2.config["inject_freeze_min_seconds"] = 0
             f2.config["pack_l2_limit"] = 6  # 6 进常驻，极低那条「喜欢潜水」留在包外
             # 先拿基线冻结块（闲聊，无话题）
             b0, _p0, _r0, m0 = f2._frozen_block("测试人", "S2", 4000, rel_text="")

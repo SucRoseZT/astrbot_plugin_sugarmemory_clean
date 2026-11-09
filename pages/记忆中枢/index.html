@@ -1092,6 +1092,7 @@
   .tag.cold { color:#7a5aa8; background:#f5efff; border-color:#dcc9f5; }
   .tag.expired { color:#a06a20; background:#fff6e5; border-color:#f2d9a6; }
   .tag.first { color:#6b7a8d; background:#f2f6fa; border-color:#d7e2ec; }
+  .tag.system { color:#3f6fa8; background:#eef5ff; border-color:#c9def5; }
   .tag.packok { color:#2e9e7b; background:#eefaf5; border-color:#bfe8d8; }
   .tag.packbad { color:#c0483f; background:#fff0ee; border-color:#f3c4bd; }
   .hitpager { display:flex; align-items:center; gap:9px; justify-content:flex-end;
@@ -1890,7 +1891,7 @@
           <div class="hitbox"><div class="colhead">按 Provider</div><div id="hitByProvider"></div></div>
           <div class="hitbox"><div class="colhead">按会话</div><div id="hitBySession"></div></div>
           <div class="hitbox"><div class="colhead">冻结包：重建轮 vs 同 fp 连续轮</div><div id="hitByState"></div></div>
-          <div class="hitbox"><div class="colhead">可解释的 0%（首轮 / 重载冷启动 / 自然过期）</div><div id="hitByFlag"></div></div>
+          <div class="hitbox"><div class="colhead">可解释的 0%（首轮 / 重载冷启动 / 自然过期 / system 变化）</div><div id="hitByFlag"></div></div>
           <div class="hitbox"><div class="colhead">按重建原因</div><div id="hitByReason"></div></div>
         </div>
         <div class="toksec">
@@ -1931,7 +1932,8 @@
             缓存输入 ÷（普通输入 + 缓存输入），包含框架 system + 历史 + 工具 schema + 记忆包；
             <b>它低不代表记忆包坏了</b>，miss 常常出在外层的历史裁剪、工具集变化、provider 缓存 TTL。<br>
             首轮、<b>重载冷启动</b>（日志会提示「本轮为重载冷启动」，这一轮 0% 是固定正常）、
-            <b>自然过期</b>（距上轮间隔超过阈值）都会单独打标，并从「有效命中率」里剔除，不算失败样本。
+            <b>自然过期</b>（距上轮间隔超过阈值）、<b>system 变化</b>（整条 system_prompt 与上一轮不同）
+            都会单独打标，并从「有效命中率」里剔除，不算失败样本。
             只有常驻前缀命中率低于 5% 且可比样本 ≥ 8 轮时，主页面才会出现这个入口。
           </div>
 
@@ -5121,17 +5123,25 @@ $('#hitHelp').onclick = e => {
 
 function hitPct(x) { return ((Number(x) || 0) * 100).toFixed(1) + '%'; }
 
-/* 逐轮标记：首轮 / 重载冷启动 / 自然过期这三类 0% 都是固定正常 */
+/* 逐轮标记：首轮 / 重载冷启动 / 自然过期 / system 变化，这四类 0% 都是固定正常 */
 function hitFlagCell(r) {
   const f = r.flag || '';
-  if (!f) return r.rebuilt ? '<span class="tag rebuild">重建</span>' : '—';
-  const cls = f === 'cold' ? 'cold' : (f === 'expired' ? 'expired' : 'first');
+  const sys = Number(r.sys_changed) === 1;
+  const sysTip = r.sys_diff || '整条 system_prompt 与上一轮不同';
+  // 主标记被 first/cold/expired 占用时，system 变化仍要单独露出，别把信息吞掉。
+  const sysTag = (sys && f !== 'system')
+    ? ` <span class="tag system" title="${esc(sysTip)}">system 变</span>` : '';
+  if (!f) return (r.rebuilt ? '<span class="tag rebuild">重建</span>' : '—') + sysTag;
+  const cls = f === 'cold' ? 'cold' : (f === 'expired' ? 'expired'
+    : (f === 'system' ? 'system' : 'first'));
   const tip = f === 'cold'
     ? '本轮为重载冷启动：插件重载 / 重启清空了内存里的冻结块，缓存命中率 0% 是固定正常的，不计入失败样本'
     : (f === 'expired'
       ? '距上一轮间隔过长，provider 前缀缓存已自然过期，0% 属正常'
-      : '本会话首轮，需要先写一次缓存，0% 属正常');
-  return `<span class="tag ${cls}" title="${esc(tip)}">${esc(r.flag_label || f)}</span>`;
+      : (f === 'system'
+        ? '整条 system_prompt 与上一轮不同：provider 从第一个 64-token 块起就不命中，后面全废。' + sysTip
+        : '本会话首轮，需要先写一次缓存，0% 属正常'));
+  return `<span class="tag ${cls}" title="${esc(tip)}">${esc(r.flag_label || f)}</span>` + sysTag;
 }
 function hitGapCell(r) {
   const v = r.gap_s;
@@ -5175,9 +5185,11 @@ function renderFpGroups(list) {
       const why = x.rebuild_reason ? '重建：' + esc(x.rebuild_reason) : '沿用旧包';
       const img = x.has_image
         ? '<span class="tag img" title="本轮消息带图片">带图片</span>' : '';
+      const sys = Number(x.sys_changed) === 1
+        ? `<span class="tag system" title="${esc(x.sys_diff || '整条 system_prompt 与上一轮不同')}">system 变</span>` : '';
       return `<div class="fpdrow">
         <span class="dt">${fmtTokClock(x.ts)}</span>
-        <span class="dr">${why} · 缓存 ${fmtTok(x.cached)} / 输入 ${fmtTok(x.input)} ${img}</span>
+        <span class="dr">${why} · 缓存 ${fmtTok(x.cached)} / 输入 ${fmtTok(x.input)} ${img} ${sys}</span>
         <span class="dh" style="color:${x.cached ? '#2e9e7b' : '#d98324'}">${hitPct(x.hit_rate)}</span>
       </div>`;
     }).join('') : '<div class="empty" style="padding:10px 0;font-size:11px">当前筛选下没有这个 fp 的逐轮记录</div>';
@@ -5288,7 +5300,7 @@ function renderHit() {
     : '剔除首轮 / 重载冷启动 / 自然过期后没有样本';
   $('#hitZero').textContent = s.zero_cached != null ? s.zero_cached : '—';
   $('#hitZeroSub').textContent = s.calls
-    ? `占 ${(s.zero_cached / s.calls * 100).toFixed(1)}% · 其中可解释 ${(fg.first||0)+(fg.cold||0)+(fg.expired||0)} 轮` : '—';
+    ? `占 ${(s.zero_cached / s.calls * 100).toFixed(1)}% · 其中可解释 ${(fg.first||0)+(fg.cold||0)+(fg.expired||0)+(fg.system||0)} 轮` : '—';
 
   const warn = [];
   if (hitLegacy) {
@@ -5404,6 +5416,7 @@ function renderHitHelp() {
     ['用量统计 token_stats_enabled', st.token_stats_enabled],
     ['自然过期阈值（秒）', st.cache_expire_gap_seconds],
     ['命中率基线分界', st.hit_baseline_since],
+    ['剔除 system 变化轮', st.hit_exclude_system_changed],
   ];
   $('#hitDocCfg').innerHTML = cfg.map(([k, v]) =>
     `<div>${esc(k)}：<b>${esc(String(v == null ? '—' : v))}</b></div>`).join('');
@@ -5436,6 +5449,9 @@ function renderHitHelp() {
   }
   if (fg.long_gap) {
     tips.push(`有 <b>${fg.long_gap} 轮自然过期</b>（距上轮 ≥ ${st.cache_expire_gap_seconds || 180} 秒，明细「距上轮」列带 ⏳）：provider 前缀缓存到点就没了，跟插件优化无关，聊天节奏密集时自然不会出现；其中 ${fg.expired || 0} 轮被单独标为自然过期，其余同时是重载冷启动。`);
+  }
+  if (fg.sys_changed) {
+    tips.push(`有 <b>${fg.sys_changed} 轮整条 system_prompt 变了</b>：provider 从第一个 64-token 块起比对，system 前面改一个字，后面几十 k 全废，这几轮 0% 与记忆包无关。明细「标记」列有蓝色 <code>system 变</code>，鼠标放上去能看首个差异行与行号；日志 <code>[SugarMemory][sys-diff]</code> 里有完整记录。${st.hit_exclude_system_changed === false ? '当前配置<b>未</b>把它们从有效命中率剔除，想剔除去「用量 → 剔除 system 变化轮」打开。' : '这些轮次已从「有效命中率」剔除。'}`);
   }
   if (!d.frozen_calls) {
     tips.push('当前筛选内<b>一条 frozen 都没有</b> → 先确认插件已重载 / 重启，并让机器人真正聊几句产生新账单；否则看到的还是优化前的数据。');
